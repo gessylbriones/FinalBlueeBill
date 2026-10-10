@@ -21,6 +21,13 @@ sign-in and password resets; Firestore stores account profiles and bills.
 
 No separate API server or `.env` file is required.
 
+## Deploy to Vercel
+
+Import the GitHub repository into Vercel with the project root as the Root
+Directory. The project is configured to build with `npm run build` and publish
+the Expo web export from `dist`. If overriding these settings in Vercel, use
+`npm run build` for the Build Command and `dist` for the Output Directory.
+
 ## Customer accounts
 
 Use **Customer → Create customer account** to register. New accounts receive a
