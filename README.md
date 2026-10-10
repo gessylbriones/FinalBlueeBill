@@ -24,9 +24,11 @@ No separate API server or `.env` file is required.
 ## Deploy to Vercel
 
 Import the GitHub repository into Vercel with the project root as the Root
-Directory. The project is configured to build with `npm run build` and publish
-the Expo web export from `dist`. If overriding these settings in Vercel, use
-`npm run build` for the Build Command and `dist` for the Output Directory.
+Directory. Use the **Other** framework preset so Vercel serves the static Expo
+web export rather than treating the source as a Node.js application. The
+project is configured to build with `npm run build` and publish from `dist`.
+If overriding these settings in Vercel, use `npm run build` for the Build
+Command and `dist` for the Output Directory.
 
 ## Customer accounts
 
