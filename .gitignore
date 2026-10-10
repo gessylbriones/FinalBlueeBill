@@ -1,0 +1,7 @@
+node_modules/
+.env
+.expo
+.expo/
+dist/
+web-build/
+data/
