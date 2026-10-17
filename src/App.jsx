@@ -1,7 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   Image,
-  Linking,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -12,10 +11,9 @@ import {
   useWindowDimensions,
   View
 } from 'react-native';
-import QRCode from 'react-native-qrcode-svg';
 import logo from './assets/bluebill-logo.png';
 import { createUserWithEmailAndPassword, sendPasswordResetEmail, signInWithEmailAndPassword, signOut as firebaseSignOut, updateProfile } from 'firebase/auth';
-import { collection, doc, getDoc, getDocs, query, serverTimestamp, setDoc, where } from 'firebase/firestore';
+import { collection, deleteDoc, doc, getDoc, getDocs, query, runTransaction, serverTimestamp, setDoc, updateDoc, where } from 'firebase/firestore';
 import { auth, db } from '../firebaseConfig';
 
 
@@ -28,8 +26,49 @@ async function loadBillsForUser(firebaseUser, isAdmin) {
   const billsQuery = isAdmin
     ? billsCollection
     : query(billsCollection, where('email', '==', firebaseUser.email));
-  const snapshot = await getDocs(billsQuery);
+  const snapshot = await getAdminCollection('bills', billsQuery);
   return snapshot.docs.map((billDocument) => billDocument.data());
+}
+
+async function loadCustomerAuthorization(email) {
+  const customerQuery = query(collection(db, 'customers'), where('email', '==', email.toLowerCase()));
+  const snapshot = await getAdminCollection('customers', customerQuery);
+  return snapshot.docs[0]?.data() || null;
+}
+
+function firestoreAccessError(resourceName, error) {
+  if (error.code === 'permission-denied' || error.code === 'firestore/permission-denied') {
+    return new Error(`Firestore denied access to ${resourceName}. Confirm the current firestore.rules are published to the Firebase project configured for this app.`);
+  }
+  return error;
+}
+
+async function getAdminCollection(collectionName, collectionQuery) {
+  try {
+    return await getDocs(collectionQuery);
+  } catch (error) {
+    const resourceName = `the "${collectionName}" collection query`;
+    const accessError = firestoreAccessError(resourceName, error);
+    if (accessError !== error && (collectionName === 'users' || collectionName === 'bills')) {
+      throw new Error(`${accessError.message} For admin access, users/{auth-uid} must have the exact role value "admin".`);
+    }
+    throw accessError;
+  }
+}
+
+async function loadAdminData() {
+  const [customersSnapshot, usersSnapshot, billsSnapshot] = await Promise.all([
+    getAdminCollection('customers', collection(db, 'customers')),
+    getAdminCollection('users', collection(db, 'users')),
+    getAdminCollection('bills', collection(db, 'bills'))
+  ]);
+  return {
+    customerUsers: customersSnapshot.docs.map((customerDocument) => customerDocument.data()),
+    registeredUsers: usersSnapshot.docs
+      .map((userDocument) => userDocument.data())
+      .filter((profile) => profile.role === roles.USER),
+    bills: billsSnapshot.docs.map((billDocument) => billDocument.data())
+  };
 }
 
 function mergeBillRecords(currentRecords, savedBills) {
@@ -76,20 +115,20 @@ const toledoBarangays = [
   'Sangi', 'Mainggit', 'Subayon', 'Talavera', 'Tubod', 'Tungkay'
 ];
 
-const users = [
-  { id: 'TCWD-TN-1001', name: 'Gessyl Mae Briones', email: 'sarah.johnson@gmail.com', phone: '+63 917 123 4567', city: 'Barangay Taboc, Toledo City', bill: 4230.00, status: 'Paid', meter: 'M-20481', previousReading: 125, currentReading: 266, dueDate: 'Oct 14, 2026', lastPayment: 'Mar 02, 2026', address: 'Blk 4 Lot 12, Taboc, Toledo City', barangay: 'Taboc', paymentMethod: 'GCash' },
-  { id: 'TCWD-TN-1002', name: 'Kurt Elemeno', email: 'michael.chen@yahoo.com', phone: '+63 915 222 1988', city: 'Barangay Bato, Toledo City', bill: 3825.00, status: 'Pending', meter: 'M-18322', previousReading: 410, currentReading: 537, dueDate: 'Mar 20, 2026', lastPayment: 'Feb 12, 2026', address: 'Zone 2, Bato, Toledo City', barangay: 'Bato', paymentMethod: 'Maya' },
-  { id: 'TCWD-TN-1003', name: 'John Lez Tayona', email: 'emily.rodriguez@gmail.com', phone: '+63 920 456 7781', city: 'Barangay Poblacion, Toledo City', bill: 3560.00, status: 'Overdue', meter: 'M-22197', previousReading: 88, currentReading: 207, dueDate: 'Mar 07, 2026', lastPayment: 'Jan 25, 2026', address: 'Poblacion Street, Toledo City', barangay: 'Poblacion', paymentMethod: 'GoTyme' },
-  { id: 'TCWD-TN-1004', name: 'Earl Joseph Taran', email: 'james.wilson@hotmail.com', phone: '+63 905 771 3344', city: 'Barangay Magsaysay, Toledo City', bill: 4685.00, status: 'Paid', meter: 'M-26654', previousReading: 220, currentReading: 376, dueDate: 'Mar 18, 2026', lastPayment: 'Mar 06, 2026', address: 'Magsaysay Extension, Toledo City', barangay: 'Magsaysay', paymentMethod: 'GCash' },
-  { id: 'TCWD-TN-1005', name: 'Johan Carl Demotor', email: 'lisa.anderson@bluebill.ph', phone: '+63 999 223 4455', city: 'Barangay Dumlog, Toledo City', bill: 3990.00, status: 'Pending', meter: 'M-31220', previousReading: 302, currentReading: 435, dueDate: 'Mar 25, 2026', lastPayment: 'Feb 26, 2026', address: 'Sitio San Jose, Dumlog, Toledo City', barangay: 'Dumlog', paymentMethod: 'Maya' }
-];
-
 function getNextTrackingNumber(records) {
   const highestNumber = records.reduce((highest, record) => {
     const match = /^TCWD-TN-(\d+)$/i.exec(record.id);
     return match ? Math.max(highest, Number(match[1])) : highest;
   }, 1000);
   return `TCWD-TN-${highestNumber + 1}`;
+}
+
+function getNextCustomerNumber(records) {
+  const highestNumber = records.reduce((highest, record) => {
+    const match = /^TCWD-CU-(\d+)$/i.exec(record.id || '');
+    return match ? Math.max(highest, Number(match[1])) : highest;
+  }, 1000);
+  return `TCWD-CU-${highestNumber + 1}`;
 }
 
 function calculateWaterBill(previousReading, currentReading) {
@@ -118,60 +157,6 @@ function getAdminSummary(accountRecords) {
     barangayBalances: Object.entries(barangayTotals).map(([name, amount]) => ({ name, amount }))
   };
 }
-
-const ewalletLinks = {
-  GCash: { app: 'gcash://', web: 'https://www.gcash.com/' },
-  Maya: { app: 'maya://', web: 'https://www.maya.ph/' },
-  GoTyme: { app: 'gotyme://', web: 'https://www.gotyme.com.ph/' }
-};
-
-async function openEwalletPayment(method) {
-  const target = ewalletLinks[method] || ewalletLinks.GCash;
-
-  try {
-    const canOpenApp = await Linking.canOpenURL(target.app);
-    if (canOpenApp) {
-      await Linking.openURL(target.app);
-      return;
-    }
-
-    await Linking.openURL(target.web);
-  } catch (error) {
-    await Linking.openURL(target.web);
-  }
-}
-
-function downloadReceiptFile(meterReading, customer) {
-  if (typeof document === 'undefined') return;
-
-  const receiptHtml = `<!doctype html>
-<html><head><meta charset="utf-8"><title>BlueBill receipt</title>
-<style>body{font-family:Arial,sans-serif;color:#111827;max-width:680px;margin:40px auto;padding:24px}h1{color:#3866ff}hr{border:0;border-top:1px solid #e5eaf3;margin:24px 0}.row{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #f1f5f9}.total{font-size:28px;font-weight:700}</style>
-</head><body><h1>BlueBill</h1><p>Water billing receipt</p><hr><div class="total">Amount due: ₱${meterReading.amount.toFixed(2)}</div><hr>
-<div class="row"><span>Customer</span><strong>${customer.name}</strong></div>
-<div class="row"><span>Service address</span><strong>${customer.address}</strong></div>
-<div class="row"><span>Previous meter reading</span><strong>${customer.previousReading} m³</strong></div>
-<div class="row"><span>Current meter reading</span><strong>${customer.currentReading} m³</strong></div>
-<div class="row"><span>Water consumption</span><strong>${meterReading.consumption} m³</strong></div>
-<div class="row"><span>Rate</span><strong>₱${waterRatePerCubicMeter}/m³</strong></div>
-<div class="row"><span>Due date</span><strong>${customer.dueDate}</strong></div>
-</body></html>`;
-  const blob = new Blob([receiptHtml], { type: 'text/html' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `bluebill-receipt-${new Date().toISOString().slice(0, 10)}.html`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
-}
-
-const history = [
-  { date: 'Feb 25, 2026', amount: 79.12, status: 'Paid' },
-  { date: 'Dec 20, 2025', amount: 99.30, status: 'Paid' },
-  { date: 'Oct 03, 2025', amount: 114.80, status: 'Paid' }
-];
 
 const customerChartBars = [42, 58, 46, 72, 66, 51, 60];
 const adminChartBars = [72, 80, 68, 88, 94, 76, 83];
@@ -220,45 +205,184 @@ export default function App() {
   const [screen, setScreen] = useState('splash');
   const [role, setRole] = useState(roles.ADMIN);
   const [user, setUser] = useState(null);
-  const [accountRecords, setAccountRecords] = useState(users);
-  const [selectedCustomer, setSelectedCustomer] = useState(null);
+  const [accountRecords, setAccountRecords] = useState([]);
+  const [customerUsers, setCustomerUsers] = useState([]);
+  const [registeredUsers, setRegisteredUsers] = useState([]);
   const [customerAccount, setCustomerAccount] = useState(null);
+  const [selectedBillingCustomer, setSelectedBillingCustomer] = useState(null);
+
+  async function saveCustomerRecord(record) {
+    const existingCustomer = customerUsers.find((customer) => customer.email.toLowerCase() === record.email.toLowerCase());
+    if (existingCustomer) {
+      throw new Error(`This email is already authorized under customer number ${existingCustomer.customerNumber}.`);
+    }
+    const firstNumber = Number(getNextCustomerNumber(customerUsers).replace('TCWD-CU-', ''));
+    try {
+      const customer = await runTransaction(db, async (transaction) => {
+        let sequence = firstNumber;
+        let customerReference;
+        let customerNumber;
+        while (true) {
+          customerNumber = `TCWD-CU-${sequence}`;
+          customerReference = doc(db, 'customers', customerNumber);
+          const existingCustomer = await transaction.get(customerReference);
+          if (!existingCustomer.exists()) break;
+          sequence += 1;
+        }
+        const newCustomer = {
+          id: customerNumber,
+          customerNumber,
+          name: record.name,
+          email: record.email,
+          createdAt: new Date().toISOString()
+        };
+        transaction.set(customerReference, newCustomer);
+        return newCustomer;
+      });
+      setCustomerUsers((currentCustomers) => [...currentCustomers, customer]);
+      return customer;
+    } catch (error) {
+      throw new Error(getCustomerAuthErrorMessage(error, 'add customer'));
+    }
+  }
+
+  async function refreshRegisteredUsers() {
+    try {
+      const usersSnapshot = await getAdminCollection('users', collection(db, 'users'));
+      setRegisteredUsers(usersSnapshot.docs
+        .map((userDocument) => userDocument.data())
+        .filter((profile) => profile.role === roles.USER));
+    } catch (error) {
+      throw new Error(getCustomerAuthErrorMessage(error, 'refresh registered users'));
+    }
+  }
 
   async function saveBillRecord(record) {
-    const existingIndex = accountRecords.findIndex((item) => item.name.toLowerCase() === record.customer.toLowerCase());
-    const existingRecord = existingIndex >= 0 ? accountRecords[existingIndex] : null;
-    const nextRecord = {
-      ...(existingRecord || {}),
-      id: existingRecord?.id || getNextTrackingNumber(accountRecords),
+    const existingRecord = customerUsers.find((item) => item.email === record.email);
+    const firstNumber = Number(getNextTrackingNumber(accountRecords).replace('TCWD-TN-', ''));
+    const billFields = {
       name: record.customer,
       email: record.email,
-      phone: existingRecord?.phone || 'Not provided',
+      uid: existingRecord?.uid || null,
       city: record.location,
       bill: record.amount,
       status: 'Pending',
-      meter: existingRecord?.meter || `M-${Date.now().toString().slice(-5)}`,
-      previousReading: record.previousReading,
-      currentReading: record.currentReading,
+      meter: `M-${Date.now().toString().slice(-5)}`,
+      issuedAt: new Date().toISOString(),
       dueDate: new Date(Date.now() + 30 * 86400000).toLocaleDateString('en-US', { month: 'short', day: '2-digit', year: 'numeric' }),
-      lastPayment: existingRecord?.lastPayment || 'Not paid',
+      lastPayment: 'Not paid',
       address: record.location,
-      barangay: record.location,
-      paymentMethod: existingRecord?.paymentMethod || 'GCash'
+      barangay: record.location
     };
     try {
-      await setDoc(doc(db, 'bills', nextRecord.id), nextRecord);
+      const nextRecord = await runTransaction(db, async (transaction) => {
+        let sequence = firstNumber;
+        let billReference;
+        let billNumber;
+        while (true) {
+          billNumber = `TCWD-TN-${sequence}`;
+          billReference = doc(db, 'bills', billNumber);
+          const existingBill = await transaction.get(billReference);
+          if (!existingBill.exists()) break;
+          sequence += 1;
+        }
+        const bill = { id: billNumber, ...billFields };
+        transaction.set(billReference, bill);
+        return bill;
+      });
       setAccountRecords((currentRecords) => mergeBillRecords(currentRecords, [nextRecord]));
-      setScreen('dashboard');
+      return nextRecord.id;
     } catch (error) {
       throw new Error(getCustomerAuthErrorMessage(error, 'save bill'));
     }
   }
 
-  function signIn(nextRole, name, email, customerRecord, savedBills = []) {
-    setAccountRecords((currentRecords) => mergeBillRecords(currentRecords, savedBills));
+  async function promoteUserToAdmin(profile) {
+    if (role !== roles.ADMIN || !auth.currentUser) {
+      throw new Error('Only a signed-in administrator can promote a user.');
+    }
+    try {
+      await updateDoc(doc(db, 'users', profile.uid), { role: roles.ADMIN });
+      setRegisteredUsers((currentUsers) => currentUsers.filter((candidate) => candidate.uid !== profile.uid));
+    } catch (error) {
+      throw new Error(getCustomerAuthErrorMessage(error, 'promote user to administrator'));
+    }
+  }
+
+  async function markBillPaid(bill) {
+    const paidBill = {
+      ...bill,
+      status: 'Paid',
+      lastPayment: new Date().toLocaleDateString('en-US', { month: 'short', day: '2-digit', year: 'numeric' })
+    };
+    try {
+      await updateDoc(doc(db, 'bills', bill.id), {
+        status: paidBill.status,
+        lastPayment: paidBill.lastPayment
+      });
+      setAccountRecords((currentRecords) => mergeBillRecords(currentRecords, [paidBill]));
+    } catch (error) {
+      throw new Error(getCustomerAuthErrorMessage(error, 'record offline payment'));
+    }
+  }
+
+  async function deletePaidBill(bill) {
+    if (role !== roles.USER || bill.status !== 'Paid') {
+      throw new Error('Only bills recorded as paid can be deleted from customer history.');
+    }
+    try {
+      await deleteDoc(doc(db, 'bills', bill.id));
+      setAccountRecords((currentRecords) => currentRecords.filter((record) => record.id !== bill.id));
+    } catch (error) {
+      throw new Error(getCustomerAuthErrorMessage(error, 'delete paid bill'));
+    }
+  }
+
+  const refreshBills = useCallback(async () => {
+    try {
+      if (!auth.currentUser) throw new Error('Sign in to refresh bills.');
+      const bills = await loadBillsForUser(auth.currentUser, role === roles.ADMIN);
+      setAccountRecords(bills);
+    } catch (error) {
+      throw new Error(getCustomerAuthErrorMessage(error, 'refresh bills'));
+    }
+  }, [role]);
+
+  async function saveProfile(profileChanges) {
+    const firebaseUser = auth.currentUser;
+    if (!firebaseUser) throw new Error('Sign in to update your profile.');
+    const updatedProfile = {
+      ...user,
+      name: profileChanges.name.trim(),
+      city: profileChanges.city.trim()
+    };
+    if (!updatedProfile.name) throw new Error('Enter your full name.');
+    try {
+      await updateDoc(doc(db, 'users', firebaseUser.uid), {
+        name: updatedProfile.name,
+        city: updatedProfile.city
+      });
+      setUser(updatedProfile);
+      if (role === roles.ADMIN) {
+        setRegisteredUsers((currentUsers) => currentUsers.map((profile) =>
+          profile.uid === firebaseUser.uid ? { ...profile, name: updatedProfile.name, city: updatedProfile.city } : profile
+        ));
+      }
+    } catch (error) {
+      throw new Error(getCustomerAuthErrorMessage(error, 'save profile'));
+    }
+  }
+
+  function signIn(nextRole, name, email, customerRecord, savedBills = [], adminData = null, profileData = null) {
+    setAccountRecords(nextRole === roles.ADMIN ? [] : savedBills);
+    if (adminData) {
+      setCustomerUsers(adminData.customerUsers);
+      setRegisteredUsers(adminData.registeredUsers);
+      setAccountRecords(adminData.bills);
+    }
     const nextUser = nextRole === roles.ADMIN
-      ? { name: name || 'Admin User', email: email || 'admin@bluebill.com', city: 'Toledo' }
-      : { name: name || customerRecord?.name || 'Customer', email: email || customerRecord?.email || '', city: customerRecord?.city || '' };
+      ? { uid: auth.currentUser?.uid, name: name || 'Admin User', email: email || 'admin@bluebill.com', city: profileData?.city || 'Toledo' }
+      : { uid: auth.currentUser?.uid, name: name || customerRecord?.name || 'Customer', email: email || customerRecord?.email || '', city: profileData?.city || customerRecord?.city || '', customerNumber: customerRecord?.customerNumber };
     setRole(nextRole);
     setUser(nextUser);
     setCustomerAccount(customerRecord || null);
@@ -269,6 +393,10 @@ export default function App() {
     await firebaseSignOut(auth);
     setUser(null);
     setCustomerAccount(null);
+    setCustomerUsers([]);
+    setRegisteredUsers([]);
+    setAccountRecords([]);
+    setSelectedBillingCustomer(null);
     setScreen('splash');
   }
 
@@ -281,13 +409,19 @@ export default function App() {
       <View style={styles.app}>
         <Header user={user} onProfile={() => setScreen('profile')} />
         <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-          {screen === 'dashboard' && <Dashboard role={role} user={user} accountRecords={accountRecords} customerAccount={customerAccount} onNavigate={setScreen} selectedCustomer={selectedCustomer} setSelectedCustomer={setSelectedCustomer} />}
-          {screen === 'history' && <History role={role} />}
-          {screen === 'receipt' && <Receipt customer={customerAccount || accountRecords[0]} />}
-          {screen === 'log-bill' && <LogBill onNavigate={setScreen} onSaveBill={saveBillRecord} />}
-          {screen === 'profile' && <Profile user={user} onSave={setUser} onSignOut={signOut} />}
+          {screen === 'dashboard' && <Dashboard role={role} user={user} accountRecords={accountRecords} customerUsers={customerUsers} registeredUsers={registeredUsers} onRefreshRegisteredUsers={refreshRegisteredUsers} onPromoteUser={promoteUserToAdmin} />}
+          {screen === 'history' && <History accountRecords={accountRecords} role={role} onMarkBillPaid={markBillPaid} onDeletePaidBill={deletePaidBill} onRefreshBills={refreshBills} />}
+          {screen === 'add-user' && <AddCustomer onSaveCustomer={saveCustomerRecord} />}
+          {screen === 'issue-bill' && <LogBill customerUsers={customerUsers} selectedCustomer={selectedBillingCustomer} onSelectCustomer={setSelectedBillingCustomer} onSaveBill={saveBillRecord} />}
+          {screen === 'profile' && <Profile user={user} onSave={saveProfile} onSignOut={signOut} />}
         </ScrollView>
-        <Navigation role={role} screen={screen} onNavigate={setScreen} onSignOut={signOut} />
+        {role === roles.ADMIN && screen === 'history' ? (
+          <Text style={styles.adminHistoryNote}>Note: This records an offline payment only. BlueBill does not process transactions.</Text>
+        ) : null}
+        <Navigation role={role} screen={screen} onNavigate={(nextScreen) => {
+          if (nextScreen === 'issue-bill') setSelectedBillingCustomer(null);
+          setScreen(nextScreen);
+        }} />
       </View>
     </SafeAreaView>
   );
@@ -329,14 +463,19 @@ function Login({ role, onRoleChange, onLogin }) {
 
     try {
       const credential = await signInWithEmailAndPassword(auth, email.trim().toLowerCase(), password);
-      const profileSnapshot = await getDoc(doc(db, 'users', credential.user.uid));
+      let profileSnapshot;
+      try {
+        profileSnapshot = await getDoc(doc(db, 'users', credential.user.uid));
+      } catch (error) {
+        throw firestoreAccessError(`your users/${credential.user.uid} profile document`, error);
+      }
       if (!profileSnapshot.exists()) {
         await firebaseSignOut(auth);
         setError('Your account profile is missing. Contact the system administrator.');
         return;
       }
       const profile = profileSnapshot.data();
-      const profileRole = String(profile.role || '').trim().toLowerCase();
+      const profileRole = profile.role;
 
       if (role === roles.ADMIN) {
         if (profileRole !== roles.ADMIN) {
@@ -344,26 +483,28 @@ function Login({ role, onRoleChange, onLogin }) {
           setError('This Firebase account profile does not have role "admin". Check users/{your-auth-uid} in Firestore.');
           return;
         }
-        const savedBills = await loadBillsForUser(credential.user, true);
+        const adminData = await loadAdminData();
         setError('');
-        onLogin(roles.ADMIN, profile.name || credential.user.displayName || credential.user.email, credential.user.email, null, savedBills);
+        onLogin(roles.ADMIN, profile.name || credential.user.displayName || credential.user.email, credential.user.email, null, [], adminData, profile);
         return;
       }
 
       if (profileRole !== roles.USER) {
         await firebaseSignOut(auth);
-        setError('This account is not configured as a customer account.');
+        setError(profileRole === roles.ADMIN
+          ? 'This account is now an administrator. Select Admin sign-in to continue.'
+          : 'This account is not configured as a customer account.');
+        return;
+      }
+      const customerRecord = await loadCustomerAuthorization(credential.user.email);
+      if (!customerRecord) {
+        await firebaseSignOut(auth);
+        setError('This email is not registered as an authorized customer yet. Contact an administrator to add your customer account.');
         return;
       }
       const savedBills = await loadBillsForUser(credential.user, false);
-      const customerRecord = savedBills[0];
-      if (!customerRecord) {
-        await firebaseSignOut(auth);
-        setError('Your account is signed in, but no bill is linked to this email yet. Contact the system administrator.');
-        return;
-      }
       setError('');
-      onLogin(role, credential.user.displayName || credential.user.email, credential.user.email, customerRecord, savedBills);
+      onLogin(role, profile.name || customerRecord.name || credential.user.displayName || credential.user.email, credential.user.email, customerRecord, savedBills, null, profile);
     } catch (loginError) {
       if (auth.currentUser) await firebaseSignOut(auth);
       setError(getCustomerAuthErrorMessage(loginError, 'sign in'));
@@ -454,6 +595,7 @@ function Login({ role, onRoleChange, onLogin }) {
           <Field label="Full name" value={name} onChangeText={setName} placeholder="Your full name" />
           <Field label="Email" value={email} onChangeText={setEmail} placeholder="you@example.com" keyboardType="email-address" autoComplete="off" />
           <Field label="Password" value={password} onChangeText={setPassword} placeholder="At least 8 characters" secureTextEntry autoComplete="off" />
+          <Text style={styles.customerLookupHelp}>After registration, an administrator must issue a bill to your email before you can access your bill dashboard.</Text>
           {error ? <Text style={styles.error}>{error}</Text> : null}
           <Button label="Create account" onPress={registerCustomer} />
           <Pressable style={styles.forgotPasswordButton} onPress={() => { setRegistrationMode(false); setError(''); }}>
@@ -496,7 +638,7 @@ function Login({ role, onRoleChange, onLogin }) {
         {role === roles.ADMIN ? (
           <>
             <Button label="Sign in" onPress={submit} />
-          <Text style={styles.authHint}>Admin accounts are managed by the system administrator.</Text>
+          <Text style={styles.authHint}>Admin access is granted by an existing administrator.</Text>
             <Pressable style={styles.forgotPasswordButton} onPress={openPasswordReset}>
               <Text style={styles.forgotPasswordText}>Forgot password?</Text>
             </Pressable>
@@ -534,7 +676,7 @@ function Header({ user, onProfile }) {
   );
 }
 
-function Dashboard({ role, user, accountRecords, customerAccount, onNavigate, selectedCustomer, setSelectedCustomer }) {
+function LegacyDashboard({ role, user, accountRecords, customerAccount, onNavigate, selectedCustomer, setSelectedCustomer }) {
   const textScale = useTextScale();
   const isAdmin = role === roles.ADMIN;
   const users = accountRecords;
@@ -564,21 +706,14 @@ function Dashboard({ role, user, accountRecords, customerAccount, onNavigate, se
   });
   const selectedUsage = Math.round(chartBars[selectedUsageDay] * usageScale);
   const [adminFilter, setAdminFilter] = useState('All');
-  const [paymentFilter, setPaymentFilter] = useState('All');
-  const [selectedPaymentMethod, setSelectedPaymentMethod] = useState('GCash');
-  const [showDemoPaymentQr, setShowDemoPaymentQr] = useState(false);
-  const [paymentMessage, setPaymentMessage] = useState('');
   const [adminSearch, setAdminSearch] = useState('');
   const [selectedBarangay, setSelectedBarangay] = useState(null);
   const filteredUsers = adminFilter === 'All'
     ? users
     : users.filter((item) => item.status === adminFilter);
-  const paymentFilteredUsers = paymentFilter === 'All'
-    ? filteredUsers
-    : filteredUsers.filter((item) => item.paymentMethod === paymentFilter);
   const visibleUsers = adminSearch.trim()
-    ? paymentFilteredUsers.filter((item) => `${item.id} ${item.name} ${item.email} ${item.barangay} ${item.city}`.toLowerCase().includes(adminSearch.trim().toLowerCase()))
-    : paymentFilteredUsers;
+    ? filteredUsers.filter((item) => `${item.id} ${item.name} ${item.email} ${item.barangay} ${item.city}`.toLowerCase().includes(adminSearch.trim().toLowerCase()))
+    : filteredUsers;
   const customersByBarangay = Object.values(users.reduce((groups, item) => {
     if (!groups[item.barangay]) groups[item.barangay] = { name: item.barangay, customers: [] };
     groups[item.barangay].customers.push(item);
@@ -587,22 +722,6 @@ function Dashboard({ role, user, accountRecords, customerAccount, onNavigate, se
   const barangayCustomers = selectedBarangay
     ? users.filter((item) => item.barangay === selectedBarangay)
     : [];
-
-  function selectPaymentMethod(method) {
-    setSelectedPaymentMethod(method);
-    setShowDemoPaymentQr(true);
-    setPaymentMessage('This QR will not make or confirm a payment.');
-  }
-
-  async function openSelectedWallet(method) {
-    setPaymentMessage(`Opening ${method}...`);
-    try {
-      await openEwalletPayment(method);
-      setPaymentMessage(`${method} opened. This does not process or confirm a payment.`);
-    } catch {
-      setPaymentMessage(`Unable to open ${method}. Please install the app or visit its website.`);
-    }
-  }
 
   return (
     <View>
@@ -691,57 +810,13 @@ function Dashboard({ role, user, accountRecords, customerAccount, onNavigate, se
             <View style={styles.customerModalRow}><Text style={styles.customerModalLabel}>Amount due</Text><Text style={styles.customerModalValue}>₱{selectedCustomer.bill.toFixed(2)}</Text></View>
             <View style={styles.customerModalRow}><Text style={styles.customerModalLabel}>Due date</Text><Text style={styles.customerModalValue}>{selectedCustomer.dueDate}</Text></View>
             <View style={styles.customerModalRow}><Text style={styles.customerModalLabel}>Last payment</Text><Text style={styles.customerModalValue}>{selectedCustomer.lastPayment}</Text></View>
-            <View style={styles.customerModalRow}><Text style={styles.customerModalLabel}>Payment method</Text><Text style={styles.customerModalValue}>{selectedCustomer.paymentMethod}</Text></View>
-            <Pressable style={styles.payNowButton} onPress={() => openEwalletPayment(selectedCustomer.paymentMethod)}>
-              <Text style={styles.payNowButtonText}>Pay with {selectedCustomer.paymentMethod}</Text>
-            </Pressable>
             <Pressable style={styles.modalCloseButton} onPress={() => setSelectedCustomer(null)}>
               <Text style={styles.modalCloseButtonText}>Close</Text>
             </Pressable>
           </View>
         </View>
       ) : null}
-      {!isAdmin ? (
-        <Card title="Payment method" subtitle="Choose a wallet to preview the payment QR">
-          <View style={styles.paymentMethodRow}>
-            {['GCash'].map((method) => (
-              <Pressable key={method} style={[styles.paymentMethodChip, selectedPaymentMethod === method && styles.paymentMethodChipActive]} onPress={() => selectPaymentMethod(method)}>
-                <Text style={[styles.paymentMethodChipText, selectedPaymentMethod === method && styles.paymentMethodChipTextActive]}>Pay With</Text>
-              </Pressable>
-            ))}
-          </View>
-          <Text style={styles.billAmount}>Amount due: ₱{customerRecord.bill.toFixed(2)}</Text>
-          {showDemoPaymentQr ? (
-            <View style={styles.paymentQrPanel}>
-              <Text style={styles.paymentQrTitle}>{selectedPaymentMethod} payment QR</Text>
-              <View style={styles.paymentQrCode}>
-                <QRCode
-                  value={JSON.stringify({
-                    type: 'BLUEBILL_DEMO_PAYMENT',
-                    method: selectedPaymentMethod,
-                    amount: customerRecord.bill.toFixed(2),
-                    reference: customerRecord.id
-                  })}
-                  size={184}
-                  color="#111827"
-                  backgroundColor="#ffffff"
-                />
-              </View>
-              <Text style={styles.paymentQrNotice}>This QR does not collect or verify payment.</Text>
-              <Text style={styles.paymentWalletLabel}>Open an e-wallet</Text>
-              <View style={styles.paymentWalletButtons}>
-                {['GCash', 'Maya', 'GoTyme'].map((method) => (
-                  <Pressable key={method} style={styles.paymentWalletButton} onPress={() => openSelectedWallet(method)}>
-                    <Text style={styles.paymentWalletButtonText}>Open {method} app</Text>
-                  </Pressable>
-                ))}
-              </View>
-            </View>
-          ) : null}
-          {paymentMessage ? <Text style={styles.paymentMessage}>{paymentMessage}</Text> : null}
-        </Card>
-      ) : null}
-      <Card title={isAdmin ? 'Customer accounts' : 'Recent payments'} subtitle={isAdmin ? 'Accounts needing attention' : 'Your latest activity'}>
+      <Card title={isAdmin ? 'Customer accounts' : 'Issued bills'} subtitle={isAdmin ? 'Accounts needing attention' : 'Your latest bills'}>
         {isAdmin ? (
           <View>
             <View style={styles.adminSearchBox}>
@@ -755,21 +830,12 @@ function Dashboard({ role, user, accountRecords, customerAccount, onNavigate, se
                 </Pressable>
               ))}
             </View>
-            <Text style={styles.filterGroupLabel}>Payment method</Text>
-            <View style={styles.adminFilterRow}>
-              {['All', 'GCash', 'Maya', 'GoTyme'].map((option) => (
-                <Pressable key={option} style={[styles.filterChip, paymentFilter === option && styles.filterChipActive]} onPress={() => setPaymentFilter(option)}>
-                  <Text style={[styles.filterChipText, paymentFilter === option && styles.filterChipTextActive]}>{option}</Text>
-                </Pressable>
-              ))}
-            </View>
             <View style={styles.adminTableWrap}>
               <View style={styles.adminTableHeader}>
                 <Text style={styles.adminTableHeaderCell}>Tracking</Text>
                 <Text style={styles.adminTableHeaderCell}>Name</Text>
                 <Text style={styles.adminTableHeaderCell}>Barangay</Text>
                 <Text style={styles.adminTableHeaderCell}>Status</Text>
-                <Text style={styles.adminTableHeaderCell}>Method</Text>
                 <Text style={styles.adminTableHeaderCell}>Due</Text>
               </View>
               {visibleUsers.map((item) => (
@@ -782,7 +848,6 @@ function Dashboard({ role, user, accountRecords, customerAccount, onNavigate, se
                   </View>
                   <Text style={styles.adminTableCell}>{item.city.split(',')[0]}</Text>
                   <Text style={[styles.adminStatusCell, item.status === 'Paid' ? styles.adminStatusPaid : item.status === 'Pending' ? styles.adminStatusPending : styles.adminStatusOverdue]}>{item.status}</Text>
-                  <Text style={styles.adminTableCell}>{item.paymentMethod}</Text>
                   <Text style={styles.adminTableCell}>₱{item.bill.toFixed(2)}</Text>
                 </Pressable>
               ))}
@@ -790,14 +855,14 @@ function Dashboard({ role, user, accountRecords, customerAccount, onNavigate, se
             </View>
           </View>
         ) : (
-          (history).map((item, index) => (
-            <View style={styles.listRow} key={item.id || item.date}>
+          accountRecords.map((item) => (
+            <View style={styles.listRow} key={item.id}>
               <View style={styles.listIcon}><Text style={styles.listIconText}>₱</Text></View>
               <View style={styles.listMain}>
-                <Text style={styles.listTitle}>{item.date}</Text>
+                <Text style={styles.listTitle}>{item.id}</Text>
                 <Text style={styles.listSubtitle}>{item.status}</Text>
               </View>
-              <Text style={styles.amount}>₱{item.amount.toFixed(2)}</Text>
+              <Text style={styles.amount}>₱{Number(item.bill).toFixed(2)}</Text>
             </View>
           ))
         )}
@@ -842,93 +907,352 @@ function Dashboard({ role, user, accountRecords, customerAccount, onNavigate, se
           </View>
         ) : null}
       </Card>
-      <Button label={isAdmin ? 'Log a new bill' : 'View receipt'} onPress={() => onNavigate(isAdmin ? 'log-bill' : 'receipt')} secondary />
+      <Button label={isAdmin ? 'Issue a bill' : 'View bill history'} onPress={() => onNavigate(isAdmin ? 'issue-bill' : 'history')} secondary />
     </View>
   );
 }
 
-function History({ role }) {
-  const entries = role === roles.ADMIN ? users.map((item) => ({ date: item.name, amount: item.bill, status: item.status })) : history;
-  return (
-    <View>
-      <Text style={styles.eyebrow}>ACTIVITY</Text>
-      <Text style={styles.title}>Billing history</Text>
-      <Text style={styles.muted}>A clear record of every account update.</Text>
-      <Card>
-        {entries.map((item, index) => (
-          <View style={styles.historyRow} key={`${item.date}-${index}`}>
-            <View><Text style={styles.listTitle}>{item.date}</Text><Text style={styles.listSubtitle}>{item.status}</Text></View>
-            <Text style={styles.amount}>${item.amount.toFixed(2)}</Text>
-          </View>
-        ))}
-      </Card>
-    </View>
-  );
+function billStatus(bill) {
+  if (bill.status === 'Paid') return 'Paid';
+  const dueDate = new Date(bill.dueDate);
+  if (Number.isNaN(dueDate.getTime())) return bill.status || 'Pending';
+  dueDate.setHours(23, 59, 59, 999);
+  return bill.status !== 'Overdue' && dueDate < new Date() ? 'Overdue' : (bill.status || 'Pending');
 }
 
-function Receipt({ customer }) {
-  const meterReading = calculateWaterBill(customer.previousReading, customer.currentReading);
-  const [downloadMessage, setDownloadMessage] = useState('');
+function Dashboard({ role, user, accountRecords, customerUsers, registeredUsers, onRefreshRegisteredUsers, onPromoteUser }) {
+  const isAdmin = role === roles.ADMIN;
+  const [message, setMessage] = useState('');
+  const [refreshingUsers, setRefreshingUsers] = useState(false);
+  const [registeredUserSearch, setRegisteredUserSearch] = useState('');
+  const [adminCandidateSearch, setAdminCandidateSearch] = useState('');
+  const [addAdminOpen, setAddAdminOpen] = useState(false);
+  const [promotingUserId, setPromotingUserId] = useState(null);
+  const filteredRegisteredUsers = registeredUsers.filter((registeredUser) =>
+    (registeredUser.name || 'Customer').toLowerCase().includes(registeredUserSearch.trim().toLowerCase())
+  );
+  const filteredAdminCandidates = registeredUsers.filter((candidate) =>
+    `${candidate.name || ''} ${candidate.email || ''}`.toLowerCase().includes(adminCandidateSearch.trim().toLowerCase())
+  );
+  const pendingCount = accountRecords.filter((bill) => billStatus(bill) === 'Pending').length;
+  const overdueCount = accountRecords.filter((bill) => billStatus(bill) === 'Overdue').length;
+  const paidCount = accountRecords.filter((bill) => billStatus(bill) === 'Paid').length;
 
-  function downloadReceipt() {
-    downloadReceiptFile(meterReading, customer);
-    setDownloadMessage('Receipt downloaded. You can print the HTML file or save it as PDF.');
+  async function promoteUser(candidate) {
+    setPromotingUserId(candidate.uid);
+    setMessage('');
+    try {
+      await onPromoteUser(candidate);
+      setMessage(`${candidate.name || candidate.email || 'Selected user'} is now an administrator and can no longer sign in as a customer.`);
+    } catch (error) {
+      setMessage(error.message || 'Unable to promote this user.');
+    } finally {
+      setPromotingUserId(null);
+    }
+  }
+
+  async function refreshUsers() {
+    setRefreshingUsers(true);
+    setMessage('');
+    try {
+      await onRefreshRegisteredUsers();
+    } catch (error) {
+      setMessage(error.message || 'Unable to refresh registered users.');
+    } finally {
+      setRefreshingUsers(false);
+    }
   }
 
   return (
     <View>
-      <Text style={styles.eyebrow}>CURRENT BILL</Text>
-      <Text style={styles.title}>Your receipt</Text>
-      <Card>
-        <Text style={styles.receiptLabel}>Amount due</Text>
-        <Text style={styles.receiptAmount}>₱{meterReading.amount.toFixed(2)}</Text>
-        <View style={styles.divider} />
-        <Detail label="Service period" value="Feb 01 - Feb 29, 2026" />
-        <Detail label="Previous meter reading" value={`${customer.previousReading} m³`} />
-        <Detail label="Current meter reading" value={`${customer.currentReading} m³`} />
-        <Detail label="Water consumption" value={`${meterReading.consumption} m³`} />
-        <Detail label="Rate" value={`₱${waterRatePerCubicMeter}/m³`} />
-        <Detail label="Due date" value={customer.dueDate} />
-        <Detail label="Service address" value={customer.address} />
-        <StatusPill label="Pending" />
-      </Card>
-      <Button label="Download receipt" onPress={downloadReceipt} />
-      {downloadMessage ? <Text style={styles.success}>{downloadMessage}</Text> : null}
+      <Text style={styles.eyebrow}>{isAdmin ? 'ADMIN OVERVIEW' : 'CUSTOMER OVERVIEW'}</Text>
+      {isAdmin ? (
+        <View style={styles.dashboardTitleRow}>
+          <Text style={[styles.title, styles.dashboardTitle]}>Billing dashboard</Text>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={addAdminOpen ? 'Close Add New Admin menu' : 'Open Add New Admin menu'}
+            style={styles.addAdminToggle}
+            onPress={() => { setAddAdminOpen((open) => !open); setMessage(''); }}
+          >
+            <Text style={styles.addAdminToggleText}>Add New Admin</Text>
+            <Text style={styles.addAdminArrow}>{addAdminOpen ? '▴' : '▾'}</Text>
+          </Pressable>
+        </View>
+      ) : <Text style={styles.title}>{`Hello, ${user?.name?.split(' ')[0] || 'there'}.`}</Text>}
+      {isAdmin && addAdminOpen ? (
+        <Card title="Add New Admin" subtitle="Promoted users will only be able to sign in to the admin side.">
+          <Field
+            label="Search registered users"
+            value={adminCandidateSearch}
+            onChangeText={setAdminCandidateSearch}
+            placeholder="Search by name or email"
+          />
+          <ScrollView style={styles.adminCandidatesList} nestedScrollEnabled showsVerticalScrollIndicator>
+            {filteredAdminCandidates.map((candidate) => (
+              <View style={styles.adminCandidateRow} key={candidate.uid}>
+                <View style={styles.listMain}>
+                  <Text style={styles.listTitle}>{candidate.name || 'Customer'}</Text>
+                  <Text style={styles.listSubtitle}>{candidate.email}</Text>
+                </View>
+                <Pressable
+                  accessibilityRole="button"
+                  style={[styles.requestAction, promotingUserId === candidate.uid && styles.disabledAction]}
+                  onPress={() => promoteUser(candidate)}
+                  disabled={promotingUserId !== null}
+                >
+                  <Text style={styles.requestActionText}>{promotingUserId === candidate.uid ? 'Adding...' : 'Make admin'}</Text>
+                </Pressable>
+              </View>
+            ))}
+          </ScrollView>
+          {!registeredUsers.length ? <Text style={styles.emptyState}>There are no registered customer accounts to promote.</Text> : null}
+          {registeredUsers.length > 0 && !filteredAdminCandidates.length ? <Text style={styles.emptyState}>No registered users match that search.</Text> : null}
+          {message ? <Text style={message.includes('now an administrator') ? styles.success : styles.error}>{message}</Text> : null}
+        </Card>
+      ) : null}
+      <Text style={styles.muted}>{isAdmin ? 'Manage customer authorization separately from issuing consumption bills.' : 'Bills issued to your account appear here.'}</Text>
+      {!isAdmin && user?.customerNumber ? (
+        <View style={styles.trackingNumberRow}>
+          <Text style={styles.trackingNumberLabel}>Customer number</Text>
+          <Text style={styles.trackingNumberValue}>{user.customerNumber}</Text>
+        </View>
+      ) : null}
+      <View style={styles.metricsRow}>
+        <Metric label={isAdmin ? 'Registered users' : 'Pending bills'} value={isAdmin ? registeredUsers.length.toLocaleString() : pendingCount.toLocaleString()} />
+        <Metric label={isAdmin ? 'Authorized customers' : 'Paid / overdue'} value={isAdmin ? customerUsers.length.toLocaleString() : `${paidCount} / ${overdueCount}`} />
+      </View>
+      {isAdmin ? (
+        <>
+          <Card title="Registered customers / users" subtitle="Customer accounts created with email and password" centerTitle>
+            <View style={styles.registeredUsersActions}>
+              <Text style={styles.listSubtitle}>{registeredUsers.length} registered {registeredUsers.length === 1 ? 'user' : 'users'}</Text>
+              <Pressable style={styles.requestAction} onPress={refreshUsers} disabled={refreshingUsers}>
+                <Text style={styles.requestActionText}>{refreshingUsers ? 'Refreshing...' : 'Refresh list'}</Text>
+              </Pressable>
+            </View>
+            <Field label="Search users by name" value={registeredUserSearch} onChangeText={setRegisteredUserSearch} placeholder="Type a customer name" />
+            <ScrollView
+              style={styles.registeredUsersList}
+              nestedScrollEnabled
+              showsVerticalScrollIndicator
+            >
+              {filteredRegisteredUsers.map((registeredUser) => {
+                const authorizedCustomer = customerUsers.find((customer) => customer.email.toLowerCase() === registeredUser.email.toLowerCase());
+                return (
+                  <View style={styles.historyRow} key={registeredUser.uid}>
+                    <View style={styles.listMain}>
+                      <Text style={styles.listTitle}>{registeredUser.name || 'Customer'}</Text>
+                      <Text style={styles.listSubtitle}>{registeredUser.email}</Text>
+                      <Text style={styles.customerLookupHelp}>
+                        {authorizedCustomer
+                          ? `Customer number: ${authorizedCustomer.customerNumber}`
+                          : 'Not yet authorized by an admin'}
+                      </Text>
+                    </View>
+                  </View>
+                );
+              })}
+            </ScrollView>
+            {!registeredUsers.length ? <Text style={styles.emptyState}>No customer accounts have registered yet.</Text> : null}
+            {registeredUsers.length > 0 && !filteredRegisteredUsers.length ? <Text style={styles.emptyState}>No users match that name.</Text> : null}
+          </Card>
+        </>
+      ) : (
+        <>
+          <Card title="Pending bills" subtitle="Payment is handled outside BlueBill; status is maintained by administrators">
+            {accountRecords.filter((bill) => billStatus(bill) === 'Pending' || billStatus(bill) === 'Overdue').map((bill) => (
+              <View style={styles.historyRow} key={bill.id}>
+                <View style={styles.listMain}>
+                  <Text style={styles.listTitle}>{bill.id}</Text>
+                  <Text style={styles.listSubtitle}>Due {bill.dueDate} · {billStatus(bill)}</Text>
+                </View>
+                <Text style={styles.amount}>₱{Number(bill.bill).toFixed(2)}</Text>
+              </View>
+            ))}
+            {!accountRecords.some((bill) => billStatus(bill) === 'Pending' || billStatus(bill) === 'Overdue') ? <Text style={styles.emptyState}>You have no pending bills.</Text> : null}
+          </Card>
+        </>
+      )}
+      {message && isAdmin && !addAdminOpen ? <Text style={styles.error}>{message}</Text> : null}
     </View>
   );
 }
 
-function LogBill({ onNavigate, onSaveBill }) {
-  const [customer, setCustomer] = useState('');
-  const [email, setEmail] = useState('');
-  const [location, setLocation] = useState('');
-  const [previousReading, setPreviousReading] = useState('');
-  const [currentReading, setCurrentReading] = useState('');
+function History({ accountRecords, role, onMarkBillPaid, onDeletePaidBill, onRefreshBills }) {
+  const isAdmin = role === roles.ADMIN;
   const [message, setMessage] = useState('');
-  const [saving, setSaving] = useState(false);
-  const meterReading = calculateWaterBill(previousReading, currentReading);
+  const [deleteConfirmationId, setDeleteConfirmationId] = useState(null);
+  const [deletingBillId, setDeletingBillId] = useState(null);
 
-  async function saveBill() {
-    if (saving) return;
-    if (!customer.trim() || !email.trim() || !email.includes('@') || !location.trim() || !previousReading.trim() || !currentReading.trim()) {
-      setMessage('Enter the customer name, valid account email, service location, and meter readings before saving.');
-      return;
+  useEffect(() => {
+    let isActive = true;
+    onRefreshBills().catch((error) => {
+      if (isActive) setMessage(error.message || 'Unable to refresh bills.');
+    });
+    return () => {
+      isActive = false;
+    };
+  }, [onRefreshBills]);
+
+  async function markBillPaid(bill) {
+    setMessage('');
+    try {
+      await onMarkBillPaid(bill);
+    } catch (error) {
+      setMessage(error.message || 'Unable to record the offline payment.');
     }
-    if (Number(currentReading) < Number(previousReading)) {
-      setMessage('Current meter reading must be greater than the previous reading.');
+  }
+
+  async function deletePaidBill(bill) {
+    if (deletingBillId) return;
+    setDeletingBillId(bill.id);
+    setMessage('');
+    try {
+      await onDeletePaidBill(bill);
+      setDeleteConfirmationId(null);
+    } catch (error) {
+      setMessage(error.message || 'Unable to delete this paid bill.');
+    } finally {
+      setDeletingBillId(null);
+    }
+  }
+
+  return (
+    <View>
+      <Text style={styles.eyebrow}>ACTIVITY</Text>
+      <Text style={styles.title}>Bill history</Text>
+      <Text style={styles.muted}>{isAdmin ? 'All bills issued to customers. Record payments made outside BlueBill.' : 'Paid and overdue bills issued to your account.'}</Text>
+      <Card>
+        {accountRecords
+          .filter((bill) => isAdmin || billStatus(bill) === 'Paid' || billStatus(bill) === 'Overdue')
+          .map((bill) => (
+            <View style={styles.historyRow} key={bill.id}>
+              <View style={styles.listMain}>
+                <Text style={styles.listTitle}>{isAdmin ? `${bill.id} · ${bill.name}` : bill.id}</Text>
+                <Text style={styles.listSubtitle}>{billStatus(bill)} · Due {bill.dueDate}</Text>
+              </View>
+              <Text style={styles.amount}>₱{Number(bill.bill).toFixed(2)}</Text>
+              {isAdmin && billStatus(bill) !== 'Paid' ? (
+                <Pressable style={styles.requestAction} onPress={() => markBillPaid(bill)}>
+                  <Text style={styles.requestActionText}>Record paid</Text>
+                </Pressable>
+              ) : null}
+              {!isAdmin && billStatus(bill) === 'Paid' ? (
+                deleteConfirmationId === bill.id ? (
+                  <View style={styles.requestActions}>
+                    <Pressable
+                      style={styles.requestRejectAction}
+                      onPress={() => deletePaidBill(bill)}
+                      disabled={deletingBillId === bill.id}
+                    >
+                      <Text style={styles.requestRejectText}>{deletingBillId === bill.id ? 'Deleting...' : 'Confirm delete'}</Text>
+                    </Pressable>
+                    <Pressable
+                      style={styles.requestAction}
+                      onPress={() => setDeleteConfirmationId(null)}
+                      disabled={deletingBillId === bill.id}
+                    >
+                      <Text style={styles.requestActionText}>Cancel</Text>
+                    </Pressable>
+                  </View>
+                ) : (
+                  <Pressable
+                    style={styles.requestRejectAction}
+                    onPress={() => setDeleteConfirmationId(bill.id)}
+                  >
+                    <Text style={styles.requestRejectText}>Delete</Text>
+                  </Pressable>
+                )
+              ) : null}
+            </View>
+          ))}
+        {!accountRecords.some((bill) => isAdmin || billStatus(bill) === 'Paid' || billStatus(bill) === 'Overdue') ? <Text style={styles.emptyState}>No bill history yet.</Text> : null}
+      </Card>
+      {message ? <Text style={styles.error}>{message}</Text> : null}
+    </View>
+  );
+}
+
+function AddCustomer({ onSaveCustomer }) {
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [message, setMessage] = useState('');
+  const [customerNumber, setCustomerNumber] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  async function addCustomer() {
+    if (saving) return;
+    if (!name.trim() || !email.trim() || !email.includes('@')) {
+      setMessage('Enter the confirmed customer name and a valid email address.');
       return;
     }
     setSaving(true);
     setMessage('');
+    setCustomerNumber('');
     try {
-      await onSaveBill({
-        customer: customer.trim(),
-        email: email.trim().toLowerCase(),
+      const customer = await onSaveCustomer({ name: name.trim(), email: email.trim().toLowerCase() });
+      setCustomerNumber(customer.customerNumber);
+      setMessage('Customer added. Share the customer number with them. Issue water bills separately from the Issue bill screen.');
+      setName('');
+      setEmail('');
+    } catch (error) {
+      setMessage(error.message || 'Unable to add customer.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <View>
+      <Text style={styles.eyebrow}>ADMIN TOOL</Text>
+      <Text style={styles.title}>Add user</Text>
+      <Text style={styles.muted}>Confirm the customer's email and create their customer account number. This does not issue a water-consumption bill.</Text>
+      <Card title="Customer authorization" subtitle="The customer signs in with the same email and their own password. Their authorized account is matched automatically." centerTitle centerSubtitle>
+        <Field label="Confirmed customer name" value={name} onChangeText={setName} placeholder="Customer name" />
+        <Field label="Confirmed customer email" value={email} onChangeText={setEmail} placeholder="customer@example.com" keyboardType="email-address" autoCapitalize="none" />
+        {customerNumber ? <Text style={styles.success}>Customer number: {customerNumber}</Text> : null}
+        {message ? <Text style={customerNumber ? styles.success : styles.error}>{message}</Text> : null}
+        <Button label={saving ? 'Adding customer...' : 'Add customer'} onPress={addCustomer} />
+      </Card>
+    </View>
+  );
+}
+
+function LogBill({ customerUsers, selectedCustomer, onSelectCustomer, onSaveBill }) {
+  const [location, setLocation] = useState('');
+  const [billAmount, setBillAmount] = useState('');
+  const [customerSearch, setCustomerSearch] = useState('');
+  const [message, setMessage] = useState('');
+  const [issuedBillNumber, setIssuedBillNumber] = useState('');
+  const [saving, setSaving] = useState(false);
+  const filteredCustomers = customerUsers.filter((customer) =>
+    (customer.name || 'Customer').toLowerCase().includes(customerSearch.trim().toLowerCase())
+  );
+
+  async function saveBill() {
+    if (saving) return;
+    const amount = Number(billAmount);
+    if (!selectedCustomer || !location.trim() || !billAmount.trim()) {
+      setMessage('Select an authorized customer, enter the service location, and enter the bill amount.');
+      return;
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setMessage('Enter a bill amount greater than ₱0.00.');
+      return;
+    }
+    setSaving(true);
+    setMessage('');
+    setIssuedBillNumber('');
+    try {
+      const billNumber = await onSaveBill({
+        customer: selectedCustomer.name,
+        email: selectedCustomer.email,
         location: location.trim(),
-        previousReading: Number(previousReading),
-        currentReading: Number(currentReading),
-        amount: meterReading.amount
+        amount
       });
+      setIssuedBillNumber(billNumber);
+      setMessage('Bill issued and available in the customer dashboard.');
     } catch (error) {
       setMessage(error.message || 'Unable to save bill permanently.');
     } finally {
@@ -939,24 +1263,36 @@ function LogBill({ onNavigate, onSaveBill }) {
   return (
     <View>
       <Text style={styles.eyebrow}>ADMIN TOOL</Text>
-      <Text style={styles.title}>Log a bill</Text>
-      <Text style={styles.muted}>Add a new charge to a Toledo City customer account.</Text>
+      <Text style={styles.title}>Issue bill</Text>
+      <Text style={styles.muted}>Create a pending water-consumption bill for an authorized customer. Customer authorization is managed separately in Add user.</Text>
       <Card>
-        <Field label="Customer" value={customer} onChangeText={setCustomer} placeholder="Customer name" />
-        <Field label="Customer account email" value={email} onChangeText={setEmail} placeholder="customer@example.com" keyboardType="email-address" autoCapitalize="none" />
+        {customerUsers.length ? (
+          <View>
+            <Text style={styles.customerPickerTitle}>Select a customer</Text>
+            <Field label="Search customers by name" value={customerSearch} onChangeText={setCustomerSearch} placeholder="Type a customer name" />
+            <ScrollView
+              style={styles.issueCustomerList}
+              nestedScrollEnabled
+              showsVerticalScrollIndicator
+            >
+              {filteredCustomers.map((account) => (
+                <Pressable key={account.id} style={[styles.customerOption, selectedCustomer?.id === account.id && styles.customerOptionActive]} onPress={() => { onSelectCustomer(account); setMessage(''); }}>
+                  <Text style={styles.listTitle}>{account.name || 'Customer'} · {account.customerNumber}</Text>
+                  <Text style={styles.listSubtitle}>{account.email}</Text>
+                </Pressable>
+              ))}
+            </ScrollView>
+            {!filteredCustomers.length ? <Text style={styles.emptyState}>No authorized customers match that name.</Text> : null}
+          </View>
+        ) : null}
+        {!customerUsers.length ? <Text style={styles.emptyState}>Add an authorized customer before issuing a bill.</Text> : null}
+        {selectedCustomer ? <Text style={styles.customerLookupDetails}>Billing {selectedCustomer.name} ({selectedCustomer.email}) · {selectedCustomer.customerNumber}</Text> : null}
         <Field label="Location" value={location} onChangeText={setLocation} placeholder="Barangay, city, or service address" />
-        <Field label="Previous meter reading (m³)" value={previousReading} onChangeText={setPreviousReading} placeholder="125" keyboardType="decimal-pad" />
-        <Field label="Current meter reading (m³)" value={currentReading} onChangeText={setCurrentReading} placeholder="132" keyboardType="decimal-pad" />
-        <View style={styles.calculationBox}>
-          <Text style={styles.calculationTitle}>Bill calculation</Text>
-          <Text style={styles.calculationText}>Consumption: {meterReading.consumption} m³</Text>
-          <Text style={styles.calculationText}>Rate: ₱{waterRatePerCubicMeter}/m³</Text>
-          <Text style={styles.calculationAmount}>Total: ₱{meterReading.amount.toFixed(2)}</Text>
-        </View>
-        {message ? <Text style={styles.error}>{message}</Text> : null}
-        <Button label={saving ? 'Saving...' : 'Save bill'} onPress={saveBill} />
+        <Field label="Bill amount (₱)" value={billAmount} onChangeText={setBillAmount} placeholder="0.00" keyboardType="decimal-pad" />
+        {issuedBillNumber ? <Text style={styles.success}>Issued bill number: {issuedBillNumber}</Text> : null}
+        {message ? <Text style={issuedBillNumber ? styles.success : styles.error}>{message}</Text> : null}
+        <Button label={saving ? 'Saving...' : 'Issue pending bill'} onPress={saveBill} />
       </Card>
-      <Button label="Back to dashboard" onPress={() => onNavigate('dashboard')} secondary />
     </View>
   );
 }
@@ -965,6 +1301,22 @@ function Profile({ user, onSave, onSignOut }) {
   const [name, setName] = useState(user?.name || '');
   const [city, setCity] = useState(user?.city || '');
   const [message, setMessage] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  async function saveChanges() {
+    if (saving) return;
+    setSaving(true);
+    setMessage('');
+    try {
+      await onSave({ name, city });
+      setMessage('Profile updated.');
+    } catch (error) {
+      setMessage(error.message || 'Unable to save profile changes.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <View>
       <Text style={styles.eyebrow}>ACCOUNT</Text>
@@ -973,18 +1325,18 @@ function Profile({ user, onSave, onSignOut }) {
         <Field label="Full name" value={name} onChangeText={setName} />
         <Field label="Email" value={user?.email || ''} editable={false} />
         <Field label="City or district" value={city} onChangeText={setCity} />
-        {message ? <Text style={styles.success}>{message}</Text> : null}
-        <Button label="Save changes" onPress={() => { onSave({ ...user, name, city }); setMessage('Profile updated.'); }} />
+        {message ? <Text style={message === 'Profile updated.' ? styles.success : styles.error}>{message}</Text> : null}
+        <Button label={saving ? 'Saving...' : 'Save changes'} onPress={saveChanges} />
       </Card>
       <Button label="Sign out" onPress={onSignOut} secondary />
     </View>
   );
 }
 
-function Navigation({ role, screen, onNavigate, onSignOut }) {
+function Navigation({ role, screen, onNavigate }) {
   const items = role === roles.ADMIN
-    ? [['dashboard', 'Home'], ['log-bill', 'Log bill'], ['history', 'History'], ['profile', 'Profile']]
-    : [['dashboard', 'Home'], ['receipt', 'Receipt'], ['history', 'History'], ['profile', 'Profile']];
+    ? [['dashboard', 'Home'], ['add-user', 'Add user'], ['issue-bill', 'Issue bill'], ['history', 'History']]
+    : [['dashboard', 'Home'], ['history', 'Bill history']];
   return (
     <View style={styles.navigation}>
       {items.map(([target, label]) => (
@@ -992,13 +1344,12 @@ function Navigation({ role, screen, onNavigate, onSignOut }) {
           <Text style={[styles.navLabel, screen === target && styles.navLabelActive]}>{label}</Text>
         </Pressable>
       ))}
-      <Pressable style={styles.navItem} onPress={onSignOut}><Text style={styles.navLabel}>Sign out</Text></Pressable>
     </View>
   );
 }
 
-function Card({ title, subtitle, children }) {
-  return <View style={styles.card}>{title ? <Text style={styles.cardTitle}>{title}</Text> : null}{subtitle ? <Text style={styles.cardSubtitle}>{subtitle}</Text> : null}{children}</View>;
+function Card({ title, subtitle, children, centerTitle = false, centerSubtitle = false }) {
+  return <View style={styles.card}>{title ? <Text style={[styles.cardTitle, centerTitle && styles.cardTitleCentered]}>{title}</Text> : null}{subtitle ? <Text style={[styles.cardSubtitle, centerSubtitle && styles.cardSubtitleCentered]}>{subtitle}</Text> : null}{children}</View>;
 }
 
 function Metric({ label, value, note }) { return <View style={styles.metric}><Text style={styles.metricLabel}>{label}</Text><Text style={styles.metricValue}>{value}</Text>{note ? <Text style={styles.metricNote}>{note}</Text> : null}</View>; }
@@ -1018,6 +1369,14 @@ const styles = StyleSheet.create({
   authWrap: { flexGrow: 1, padding: 24, justifyContent: 'center' },
   authLogo: { width: 180, height: 72, alignSelf: 'center', marginBottom: 24 },
   title: { color: colors.text, fontSize: 30, fontWeight: '800', marginBottom: 8 },
+  dashboardTitleRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10 },
+  dashboardTitle: { flexShrink: 1 },
+  addAdminToggle: { flexDirection: 'row', alignItems: 'center', gap: 5, borderWidth: 1, borderColor: colors.border, borderRadius: 10, backgroundColor: colors.surface, paddingHorizontal: 10, paddingVertical: 8, marginTop: 1 },
+  addAdminToggleText: { color: colors.primary, fontWeight: '800', fontSize: 12 },
+  addAdminArrow: { color: colors.primary, fontSize: 14, fontWeight: '900' },
+  adminCandidatesList: { maxHeight: 280 },
+  adminCandidateRow: { flexDirection: 'row', alignItems: 'center', gap: 10, borderBottomWidth: 1, borderBottomColor: '#eef1f6', paddingVertical: 10 },
+  disabledAction: { opacity: 0.55 },
   splashTitle: { color: colors.text, fontSize: 40, fontWeight: '800', marginBottom: 8, textAlign: 'center' },
   muted: { color: colors.muted, fontSize: 16, lineHeight: 24, marginBottom: 20 },
   liveDateTime: { color: colors.primary, fontSize: 14, fontWeight: '700', marginTop: -10, marginBottom: 14 },
@@ -1039,6 +1398,8 @@ const styles = StyleSheet.create({
   visibilityIcon: { fontSize: 18 },
   error: { color: '#dc2626', marginBottom: 14 },
   customerLookupHelp: { color: colors.muted, fontSize: 14, lineHeight: 20, marginTop: 4, marginBottom: 14 },
+  customerPickerTitle: { color: colors.text, fontSize: 18, fontWeight: '800', textAlign: 'center', marginBottom: 12 },
+  issueCustomerList: { maxHeight: 270 },
   customerLookupResult: { padding: 16, marginBottom: 14, borderWidth: 1, borderColor: colors.primary, borderRadius: 12, backgroundColor: colors.primarySoft },
   customerLookupName: { color: colors.text, fontSize: 18, fontWeight: '800', marginBottom: 4 },
   customerLookupDetails: { color: colors.muted, fontSize: 14, marginBottom: 10 },
@@ -1073,7 +1434,9 @@ const styles = StyleSheet.create({
   metricNote: { color: colors.primary, fontSize: 12, fontWeight: '700', marginTop: 6 },
   card: { backgroundColor: colors.surface, borderRadius: 18, borderWidth: 1, borderColor: colors.border, padding: 18, marginVertical: 8 },
   cardTitle: { color: colors.text, fontSize: 18, fontWeight: '800' },
+  cardTitleCentered: { textAlign: 'center' },
   cardSubtitle: { color: colors.muted, fontSize: 14, marginTop: 4, marginBottom: 18 },
+  cardSubtitleCentered: { textAlign: 'center' },
   adminHealthGrid: { flexDirection: 'row', gap: 12 },
   adminHealthStat: { flex: 1, paddingRight: 10, borderRightWidth: 1, borderRightColor: colors.border },
   adminHealthLabel: { color: colors.muted, fontSize: 14, fontWeight: '700', marginBottom: 7 },
@@ -1129,8 +1492,6 @@ const styles = StyleSheet.create({
   customerModalRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#eef1f6' },
   customerModalLabel: { color: colors.muted, fontSize: 14, fontWeight: '700' },
   customerModalValue: { color: colors.text, fontSize: 14, fontWeight: '700', textAlign: 'right', maxWidth: '60%' },
-  payNowButton: { marginTop: 16, backgroundColor: '#10b981', borderRadius: 10, paddingVertical: 12, alignItems: 'center' },
-  payNowButtonText: { color: '#ffffff', fontWeight: '800' },
   modalCloseButton: { marginTop: 12, backgroundColor: colors.primary, borderRadius: 10, paddingVertical: 12, alignItems: 'center' },
   modalCloseButtonText: { color: '#ffffff', fontWeight: '800' },
   adminTableWrap: { marginTop: 6 },
@@ -1143,21 +1504,6 @@ const styles = StyleSheet.create({
   filterChipText: { color: colors.muted, fontWeight: '700', fontSize: 14 },
   filterChipTextActive: { color: colors.primary },
   adminTableHeader: { flexDirection: 'row', borderBottomWidth: 1, borderBottomColor: colors.border, paddingBottom: 8, marginBottom: 8 },
-  paymentMethodRow: { flexDirection: 'row', gap: 8, marginBottom: 12, flexWrap: 'wrap' },
-  paymentMethodChip: { borderWidth: 1, borderColor: colors.border, backgroundColor: '#f8fafc', borderRadius: 999, paddingHorizontal: 12, paddingVertical: 8 },
-  paymentMethodChipActive: { backgroundColor: colors.primarySoft, borderColor: colors.primary },
-  paymentMethodChipText: { color: colors.muted, fontWeight: '700', fontSize: 14 },
-  paymentMethodChipTextActive: { color: colors.primary },
-  billAmount: { color: colors.text, fontSize: 16, fontWeight: '800', marginTop: 2 },
-  paymentQrPanel: { alignItems: 'center', marginTop: 14, padding: 16, borderWidth: 1, borderColor: colors.border, borderRadius: 12, backgroundColor: '#f8fafc' },
-  paymentQrTitle: { color: colors.text, fontSize: 16, fontWeight: '800', marginBottom: 12, textAlign: 'center' },
-  paymentQrCode: { padding: 12, borderRadius: 8, backgroundColor: '#ffffff' },
-  paymentQrNotice: { color: '#92400e', fontSize: 13, fontWeight: '700', lineHeight: 19, marginTop: 12, textAlign: 'center' },
-  paymentWalletLabel: { color: colors.text, fontSize: 14, fontWeight: '700', marginTop: 16, marginBottom: 8 },
-  paymentWalletButtons: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 8 },
-  paymentWalletButton: { minWidth: 132, paddingHorizontal: 12, paddingVertical: 10, borderWidth: 1, borderColor: colors.primary, borderRadius: 8, backgroundColor: '#ffffff', alignItems: 'center' },
-  paymentWalletButtonText: { color: colors.primary, fontSize: 14, fontWeight: '800', textAlign: 'center' },
-  paymentMessage: { color: '#92400e', fontSize: 14, lineHeight: 20, marginTop: 10 },
   adminTableHeaderCell: { flex: 1, color: colors.muted, fontSize: 12, fontWeight: '800', textTransform: 'uppercase' },
   adminTableRow: { flexDirection: 'row', alignItems: 'flex-start', paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#eef1f6' },
   adminTableCell: { flex: 1, color: colors.text, fontSize: 12, fontWeight: '700' },
@@ -1169,14 +1515,22 @@ const styles = StyleSheet.create({
   adminStatusPending: { backgroundColor: '#fef3c7', color: '#92400e' },
   adminStatusOverdue: { backgroundColor: '#fee2e2', color: '#991b1b' },
   historyRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#eef1f6' },
-  receiptLabel: { color: colors.muted, fontWeight: '700' },
-  receiptAmount: { color: colors.text, fontSize: 42, fontWeight: '900', marginVertical: 8 },
+  registeredUsersActions: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 },
+  registeredUsersList: { maxHeight: 270 },
+  customerOption: { paddingVertical: 10, paddingHorizontal: 12, marginBottom: 6, borderRadius: 10, borderWidth: 1, borderColor: colors.border, backgroundColor: '#f8fafc' },
+  customerOptionActive: { backgroundColor: colors.primarySoft, borderColor: colors.primary },
+  requestActions: { flexDirection: 'row', gap: 8 },
+  requestAction: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 9, backgroundColor: colors.primarySoft },
+  requestActionText: { color: colors.primary, fontWeight: '800', fontSize: 13 },
+  requestRejectAction: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 9, backgroundColor: '#fee2e2' },
+  requestRejectText: { color: '#991b1b', fontWeight: '800', fontSize: 13 },
   divider: { height: 1, backgroundColor: colors.border, marginVertical: 12 },
   detail: { paddingVertical: 10, flexDirection: 'row', justifyContent: 'space-between', gap: 12 },
   detailValue: { color: colors.text, fontWeight: '700', flexShrink: 1, textAlign: 'right' },
   status: { alignSelf: 'flex-start', paddingVertical: 7, paddingHorizontal: 12, borderRadius: 20, backgroundColor: '#fff7ed', marginTop: 12 },
   statusText: { color: '#c2410c', fontWeight: '800', fontSize: 12 },
   navigation: { flexDirection: 'row', borderTopWidth: 1, borderTopColor: colors.border, backgroundColor: colors.surface, paddingHorizontal: 4, paddingTop: 8, paddingBottom: 6 },
+  adminHistoryNote: { color: colors.muted, fontSize: 12, lineHeight: 18, paddingHorizontal: 22, paddingTop: 6, paddingBottom: 8, backgroundColor: colors.background },
   navItem: { flex: 1, alignItems: 'center', paddingVertical: 8 },
   navLabel: { color: colors.muted, fontSize: 12, fontWeight: '700' },
   navLabelActive: { color: colors.primary }

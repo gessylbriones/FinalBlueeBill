@@ -8,7 +8,14 @@ service cloud.firestore {
 
     function isAdmin() {
       return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function isCustomer() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'user';
     }
 
     match /users/{userId} {
@@ -22,13 +29,42 @@ service cloud.firestore {
         && request.resource.data.name is string;
 
       allow get: if signedIn() && (request.auth.uid == userId || isAdmin());
-      allow list, update, delete: if false;
+      allow list: if isAdmin();
+      allow update: if (
+          isAdmin()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role'])
+          && request.resource.data.role in ['user', 'admin']
+        ) || (
+          signedIn()
+          && request.auth.uid == userId
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'city'])
+          && request.resource.data.name is string
+          && request.resource.data.city is string
+        );
+      allow delete: if false;
     }
 
     match /bills/{billId} {
       allow read: if signedIn()
         && (isAdmin() || resource.data.email == request.auth.token.email);
       allow create, update: if isAdmin();
+      allow delete: if isCustomer()
+        && resource.data.email == request.auth.token.email
+        && resource.data.status == 'Paid';
+    }
+
+    match /customers/{customerId} {
+      allow read: if isAdmin()
+        || (signedIn() && resource.data.email == request.auth.token.email);
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasAll(['id', 'customerNumber', 'name', 'email', 'createdAt'])
+        && request.resource.data.keys().hasOnly(['id', 'customerNumber', 'name', 'email', 'createdAt'])
+        && request.resource.data.id == customerId
+        && request.resource.data.customerNumber == customerId
+        && request.resource.data.name is string
+        && request.resource.data.email is string;
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'email']);
       allow delete: if false;
     }
   }
