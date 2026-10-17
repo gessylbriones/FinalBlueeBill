@@ -11,7 +11,7 @@ import {
   useWindowDimensions,
   View
 } from 'react-native';
-import logo from './assets/bluebill-logo.png';
+import logo from './assets/logo.png';
 import { createUserWithEmailAndPassword, sendPasswordResetEmail, signInWithEmailAndPassword, signOut as firebaseSignOut, updateProfile } from 'firebase/auth';
 import { collection, deleteDoc, doc, getDoc, getDocs, query, runTransaction, serverTimestamp, setDoc, updateDoc, where } from 'firebase/firestore';
 import { auth, db } from '../firebaseConfig';
