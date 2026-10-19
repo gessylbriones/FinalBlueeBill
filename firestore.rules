@@ -12,12 +12,6 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
     }
 
-    function isCustomer() {
-      return signedIn()
-        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
-        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'user';
-    }
-
     match /users/{userId} {
       allow create: if signedIn()
         && request.auth.uid == userId
@@ -48,9 +42,7 @@ service cloud.firestore {
       allow read: if signedIn()
         && (isAdmin() || resource.data.email == request.auth.token.email);
       allow create, update: if isAdmin();
-      allow delete: if isCustomer()
-        && resource.data.email == request.auth.token.email
-        && resource.data.status == 'Paid';
+      allow delete: if false;
     }
 
     match /customers/{customerId} {
@@ -63,8 +55,32 @@ service cloud.firestore {
         && request.resource.data.customerNumber == customerId
         && request.resource.data.name is string
         && request.resource.data.email is string;
-      allow update: if isAdmin()
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'email']);
+      allow update: if (
+          isAdmin()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'name', 'email', 'city', 'cycleStartReading', 'currentReading', 'cycleStartedAt', 'meterReadingUpdatedAt'
+          ])
+          && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['name'])
+            || request.resource.data.name is string)
+          && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['email'])
+            || request.resource.data.email is string)
+          && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['city'])
+            || request.resource.data.city is string)
+          && (!request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'cycleStartReading', 'currentReading', 'cycleStartedAt', 'meterReadingUpdatedAt'
+          ]) || (
+            request.resource.data.cycleStartReading is number
+            && request.resource.data.currentReading is number
+            && request.resource.data.currentReading >= request.resource.data.cycleStartReading
+            && request.resource.data.cycleStartedAt is string
+            && request.resource.data.meterReadingUpdatedAt is string
+          ))
+        ) || (
+          signedIn()
+          && resource.data.email == request.auth.token.email
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['city'])
+          && request.resource.data.city is string
+        );
       allow delete: if false;
     }
   }

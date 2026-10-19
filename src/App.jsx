@@ -12,8 +12,11 @@ import {
   View
 } from 'react-native';
 import logo from './assets/logo.png';
+import { getApp } from 'firebase/app';
 import { createUserWithEmailAndPassword, sendPasswordResetEmail, signInWithEmailAndPassword, signOut as firebaseSignOut, updateProfile } from 'firebase/auth';
-import { collection, deleteDoc, doc, getDoc, getDocs, query, runTransaction, serverTimestamp, setDoc, updateDoc, where } from 'firebase/firestore';
+import { collection, doc, getDoc, getDocs, onSnapshot, query, runTransaction, serverTimestamp, setDoc, updateDoc, where } from 'firebase/firestore';
+import QRCode from 'qrcode';
+import { jsPDF } from 'jspdf';
 import { auth, db } from '../firebaseConfig';
 
 
@@ -26,7 +29,7 @@ async function loadBillsForUser(firebaseUser, isAdmin) {
   const billsQuery = isAdmin
     ? billsCollection
     : query(billsCollection, where('email', '==', firebaseUser.email));
-  const snapshot = await getAdminCollection('bills', billsQuery);
+  const snapshot = await getAdminCollection('bills', billsQuery, { adminQuery: isAdmin });
   return snapshot.docs.map((billDocument) => billDocument.data());
 }
 
@@ -36,22 +39,42 @@ async function loadCustomerAuthorization(email) {
   return snapshot.docs[0]?.data() || null;
 }
 
-function firestoreAccessError(resourceName, error) {
+async function firestoreAccessError(resourceName, error, { adminQuery = false } = {}) {
   if (error.code === 'permission-denied' || error.code === 'firestore/permission-denied') {
+    if (adminQuery) {
+      const firebaseUser = auth.currentUser;
+      const projectId = getApp().options.projectId || 'unknown';
+      if (!firebaseUser) {
+        return new Error(`Firestore denied access to ${resourceName}. The admin session has expired; sign out and sign in again.`);
+      }
+      try {
+        const profileSnapshot = await getDoc(doc(db, 'users', firebaseUser.uid));
+        if (!profileSnapshot.exists()) {
+          return new Error(`Firestore denied access to ${resourceName}. No users/${firebaseUser.uid} profile exists in Firebase project "${projectId}".`);
+        }
+        const profileRole = profileSnapshot.data().role;
+        if (profileRole !== roles.ADMIN) {
+          return new Error(`Firestore denied access to ${resourceName}. The signed-in profile users/${firebaseUser.uid} has role "${profileRole || 'missing'}", not "admin", in Firebase project "${projectId}".`);
+        }
+        return new Error(`Firestore denied access to ${resourceName}, but users/${firebaseUser.uid} has role "admin" in Firebase project "${projectId}". Confirm the published rules are attached to this same project and the (default) Firestore database.`);
+      } catch (profileError) {
+        if (profileError.code === 'permission-denied' || profileError.code === 'firestore/permission-denied') {
+          return new Error(`Firestore denied access to ${resourceName} and to the signed-in admin profile users/${firebaseUser.uid} in Firebase project "${projectId}". Confirm the published rules are attached to this project and the (default) Firestore database.`);
+        }
+        throw profileError;
+      }
+    }
     return new Error(`Firestore denied access to ${resourceName}. Confirm the current firestore.rules are published to the Firebase project configured for this app.`);
   }
   return error;
 }
 
-async function getAdminCollection(collectionName, collectionQuery) {
+async function getAdminCollection(collectionName, collectionQuery, { adminQuery = false } = {}) {
   try {
     return await getDocs(collectionQuery);
   } catch (error) {
     const resourceName = `the "${collectionName}" collection query`;
-    const accessError = firestoreAccessError(resourceName, error);
-    if (accessError !== error && (collectionName === 'users' || collectionName === 'bills')) {
-      throw new Error(`${accessError.message} For admin access, users/{auth-uid} must have the exact role value "admin".`);
-    }
+    const accessError = await firestoreAccessError(resourceName, error, { adminQuery });
     throw accessError;
   }
 }
@@ -60,13 +83,11 @@ async function loadAdminData() {
   const [customersSnapshot, usersSnapshot, billsSnapshot] = await Promise.all([
     getAdminCollection('customers', collection(db, 'customers')),
     getAdminCollection('users', collection(db, 'users')),
-    getAdminCollection('bills', collection(db, 'bills'))
+    getAdminCollection('bills', collection(db, 'bills'), { adminQuery: true })
   ]);
   return {
     customerUsers: customersSnapshot.docs.map((customerDocument) => customerDocument.data()),
-    registeredUsers: usersSnapshot.docs
-      .map((userDocument) => userDocument.data())
-      .filter((profile) => profile.role === roles.USER),
+    registeredUsers: usersSnapshot.docs.map((userDocument) => userDocument.data()),
     bills: billsSnapshot.docs.map((billDocument) => billDocument.data())
   };
 }
@@ -134,6 +155,14 @@ function getNextCustomerNumber(records) {
 function calculateWaterBill(previousReading, currentReading) {
   const consumption = Math.max(0, Number(currentReading) - Number(previousReading));
   return { consumption, amount: consumption * waterRatePerCubicMeter };
+}
+
+function getActiveCustomerUsage(customer) {
+  if (customer.cycleStartReading === undefined || customer.currentReading === undefined) return null;
+  const cycleStartReading = Number(customer.cycleStartReading);
+  const currentReading = Number(customer.currentReading);
+  if (!Number.isFinite(cycleStartReading) || !Number.isFinite(currentReading) || currentReading < cycleStartReading) return null;
+  return currentReading - cycleStartReading;
 }
 
 function getAdminSummary(accountRecords) {
@@ -210,6 +239,7 @@ export default function App() {
   const [registeredUsers, setRegisteredUsers] = useState([]);
   const [customerAccount, setCustomerAccount] = useState(null);
   const [selectedBillingCustomer, setSelectedBillingCustomer] = useState(null);
+  const [billSyncError, setBillSyncError] = useState('');
 
   async function saveCustomerRecord(record) {
     const existingCustomer = customerUsers.find((customer) => customer.email.toLowerCase() === record.email.toLowerCase());
@@ -249,33 +279,82 @@ export default function App() {
   async function refreshRegisteredUsers() {
     try {
       const usersSnapshot = await getAdminCollection('users', collection(db, 'users'));
-      setRegisteredUsers(usersSnapshot.docs
-        .map((userDocument) => userDocument.data())
-        .filter((profile) => profile.role === roles.USER));
+      setRegisteredUsers(usersSnapshot.docs.map((userDocument) => userDocument.data()));
     } catch (error) {
       throw new Error(getCustomerAuthErrorMessage(error, 'refresh registered users'));
     }
   }
 
-  async function saveBillRecord(record) {
-    const existingRecord = customerUsers.find((item) => item.email === record.email);
+  async function recordMeterReading(customer, reading) {
+    if (role !== roles.ADMIN || !auth.currentUser) {
+      throw new Error('Only a signed-in administrator can record a meter reading.');
+    }
+    if (!Number.isFinite(reading) || reading < 0) throw new Error('Enter a valid meter reading of zero or more.');
+    try {
+      await runTransaction(db, async (transaction) => {
+        const customerReference = doc(db, 'customers', customer.id);
+        const customerSnapshot = await transaction.get(customerReference);
+        if (!customerSnapshot.exists()) throw new Error('This customer record no longer exists. Refresh and try again.');
+        const currentCustomer = customerSnapshot.data();
+        const previousReading = currentCustomer.currentReading;
+        if (previousReading !== undefined && reading < Number(previousReading)) {
+          throw new Error('The new meter reading cannot be lower than the previously recorded reading.');
+        }
+        const recordedAt = new Date().toISOString();
+        transaction.update(customerReference, previousReading === undefined
+          ? {
+              cycleStartReading: reading,
+              currentReading: reading,
+              cycleStartedAt: recordedAt,
+              meterReadingUpdatedAt: recordedAt
+            }
+          : {
+              currentReading: reading,
+              meterReadingUpdatedAt: recordedAt
+            });
+      });
+    } catch (error) {
+      throw new Error(getCustomerAuthErrorMessage(error, 'record meter reading'));
+    }
+  }
+
+  async function logBillRecord(customer) {
+    if (role !== roles.ADMIN || !auth.currentUser) {
+      throw new Error('Only a signed-in administrator can log a bill.');
+    }
     const firstNumber = Number(getNextTrackingNumber(accountRecords).replace('TCWD-TN-', ''));
-    const billFields = {
-      name: record.customer,
-      email: record.email,
-      uid: existingRecord?.uid || null,
-      city: record.location,
-      bill: record.amount,
-      status: 'Pending',
-      meter: `M-${Date.now().toString().slice(-5)}`,
-      issuedAt: new Date().toISOString(),
-      dueDate: new Date(Date.now() + 30 * 86400000).toLocaleDateString('en-US', { month: 'short', day: '2-digit', year: 'numeric' }),
-      lastPayment: 'Not paid',
-      address: record.location,
-      barangay: record.location
-    };
     try {
       const nextRecord = await runTransaction(db, async (transaction) => {
+        const customerReference = doc(db, 'customers', customer.id);
+        const customerSnapshot = await transaction.get(customerReference);
+        if (!customerSnapshot.exists()) throw new Error('This customer record no longer exists. Refresh and try again.');
+        const currentCustomer = customerSnapshot.data();
+        const previousReading = Number(currentCustomer.cycleStartReading);
+        const currentReading = Number(currentCustomer.currentReading);
+        if (!Number.isFinite(previousReading) || !Number.isFinite(currentReading)) {
+          throw new Error('Record the customer’s starting meter reading before logging a bill.');
+        }
+        const consumption = currentReading - previousReading;
+        if (consumption <= 0) throw new Error('There is no new water usage to bill. Record a higher meter reading first.');
+        const issuedAt = new Date();
+        const issuedAtString = issuedAt.toISOString();
+        const billFields = {
+          name: currentCustomer.name,
+          email: currentCustomer.email,
+          uid: customer.uid || null,
+          customerNumber: currentCustomer.customerNumber,
+          city: currentCustomer.city || currentCustomer.barangay || 'Toledo',
+          bill: consumption * waterRatePerCubicMeter,
+          previousReading,
+          currentReading,
+          status: 'Pending',
+          meter: currentCustomer.meter || `M-${String(currentCustomer.customerNumber).slice(-5)}`,
+          issuedAt: issuedAtString,
+          dueDate: new Date(issuedAt.getTime() + 30 * 86400000).toLocaleDateString('en-US', { month: 'short', day: '2-digit', year: 'numeric' }),
+          lastPayment: 'Not paid',
+          address: currentCustomer.address || currentCustomer.city || currentCustomer.barangay || 'Toledo',
+          barangay: currentCustomer.barangay || currentCustomer.city || 'Toledo'
+        };
         let sequence = firstNumber;
         let billReference;
         let billNumber;
@@ -288,24 +367,34 @@ export default function App() {
         }
         const bill = { id: billNumber, ...billFields };
         transaction.set(billReference, bill);
+        transaction.update(customerReference, {
+          cycleStartReading: currentReading,
+          cycleStartedAt: issuedAtString,
+          meterReadingUpdatedAt: issuedAtString
+        });
         return bill;
       });
       setAccountRecords((currentRecords) => mergeBillRecords(currentRecords, [nextRecord]));
-      return nextRecord.id;
+      return nextRecord;
     } catch (error) {
-      throw new Error(getCustomerAuthErrorMessage(error, 'save bill'));
+      throw new Error(getCustomerAuthErrorMessage(error, 'log bill'));
     }
   }
 
-  async function promoteUserToAdmin(profile) {
+  async function setUserAdminRole(profile, makeAdmin) {
     if (role !== roles.ADMIN || !auth.currentUser) {
-      throw new Error('Only a signed-in administrator can promote a user.');
+      throw new Error('Only a signed-in administrator can change administrator access.');
+    }
+    if (profile.uid === auth.currentUser.uid && !makeAdmin) {
+      throw new Error('You cannot remove your own administrator access.');
     }
     try {
-      await updateDoc(doc(db, 'users', profile.uid), { role: roles.ADMIN });
-      setRegisteredUsers((currentUsers) => currentUsers.filter((candidate) => candidate.uid !== profile.uid));
+      await updateDoc(doc(db, 'users', profile.uid), { role: makeAdmin ? roles.ADMIN : roles.USER });
+      setRegisteredUsers((currentUsers) => currentUsers.map((candidate) =>
+        candidate.uid === profile.uid ? { ...candidate, role: makeAdmin ? roles.ADMIN : roles.USER } : candidate
+      ));
     } catch (error) {
-      throw new Error(getCustomerAuthErrorMessage(error, 'promote user to administrator'));
+      throw new Error(getCustomerAuthErrorMessage(error, makeAdmin ? 'add administrator' : 'remove administrator'));
     }
   }
 
@@ -326,18 +415,6 @@ export default function App() {
     }
   }
 
-  async function deletePaidBill(bill) {
-    if (role !== roles.USER || bill.status !== 'Paid') {
-      throw new Error('Only bills recorded as paid can be deleted from customer history.');
-    }
-    try {
-      await deleteDoc(doc(db, 'bills', bill.id));
-      setAccountRecords((currentRecords) => currentRecords.filter((record) => record.id !== bill.id));
-    } catch (error) {
-      throw new Error(getCustomerAuthErrorMessage(error, 'delete paid bill'));
-    }
-  }
-
   const refreshBills = useCallback(async () => {
     try {
       if (!auth.currentUser) throw new Error('Sign in to refresh bills.');
@@ -347,6 +424,46 @@ export default function App() {
       throw new Error(getCustomerAuthErrorMessage(error, 'refresh bills'));
     }
   }, [role]);
+
+  useEffect(() => {
+    const firebaseUser = auth.currentUser;
+    if (!user || !firebaseUser) return undefined;
+    const billsCollection = collection(db, 'bills');
+    const billsQuery = role === roles.ADMIN
+      ? billsCollection
+      : query(billsCollection, where('email', '==', firebaseUser.email));
+    setBillSyncError('');
+    return onSnapshot(
+      billsQuery,
+      (snapshot) => {
+        setAccountRecords(snapshot.docs.map((billDocument) => billDocument.data()));
+        setBillSyncError('');
+      },
+      (error) => {
+        const isAdminQuery = role === roles.ADMIN;
+        void firestoreAccessError(`the "${isAdminQuery ? 'admin ' : ''}bills" live query`, error, { adminQuery: isAdminQuery })
+          .then((accessError) => setBillSyncError(getCustomerAuthErrorMessage(accessError, 'sync bills')))
+          .catch((diagnosticError) => setBillSyncError(getCustomerAuthErrorMessage(diagnosticError, 'diagnose bill access')));
+      }
+    );
+  }, [role, user]);
+
+  useEffect(() => {
+    const firebaseUser = auth.currentUser;
+    if (!user || !firebaseUser) return undefined;
+    const customersCollection = collection(db, 'customers');
+    const customersQuery = role === roles.ADMIN
+      ? customersCollection
+      : query(customersCollection, where('email', '==', firebaseUser.email.toLowerCase()));
+    return onSnapshot(
+      customersQuery,
+      (snapshot) => {
+        setCustomerUsers(snapshot.docs.map((customerDocument) => customerDocument.data()));
+        setBillSyncError('');
+      },
+      (error) => setBillSyncError(getCustomerAuthErrorMessage(error, 'sync customer meter readings'))
+    );
+  }, [role, user]);
 
   async function saveProfile(profileChanges) {
     const firebaseUser = auth.currentUser;
@@ -358,12 +475,31 @@ export default function App() {
     };
     if (!updatedProfile.name) throw new Error('Enter your full name.');
     try {
-      await updateDoc(doc(db, 'users', firebaseUser.uid), {
-        name: updatedProfile.name,
-        city: updatedProfile.city
+      await runTransaction(db, async (transaction) => {
+        const profileReference = doc(db, 'users', firebaseUser.uid);
+        let customerReference;
+        if (role === roles.USER && customerAccount?.customerNumber) {
+          customerReference = doc(db, 'customers', customerAccount.customerNumber);
+          const customerSnapshot = await transaction.get(customerReference);
+          if (!customerSnapshot.exists()) throw new Error('Your authorized customer record could not be found. Contact customer service.');
+        }
+        transaction.update(profileReference, {
+          name: updatedProfile.name,
+          city: updatedProfile.city
+        });
+        if (customerReference) transaction.update(customerReference, { city: updatedProfile.city });
       });
       setUser(updatedProfile);
-      if (role === roles.ADMIN) {
+      if (role === roles.USER) {
+        setCustomerAccount((currentCustomer) => currentCustomer
+          ? { ...currentCustomer, city: updatedProfile.city }
+          : currentCustomer);
+        setCustomerUsers((currentCustomers) => currentCustomers.map((customer) =>
+          customer.customerNumber === customerAccount?.customerNumber
+            ? { ...customer, city: updatedProfile.city }
+            : customer
+        ));
+      } else {
         setRegisteredUsers((currentUsers) => currentUsers.map((profile) =>
           profile.uid === firebaseUser.uid ? { ...profile, name: updatedProfile.name, city: updatedProfile.city } : profile
         ));
@@ -397,6 +533,7 @@ export default function App() {
     setRegisteredUsers([]);
     setAccountRecords([]);
     setSelectedBillingCustomer(null);
+    setBillSyncError('');
     setScreen('splash');
   }
 
@@ -409,17 +546,22 @@ export default function App() {
       <View style={styles.app}>
         <Header user={user} onProfile={() => setScreen('profile')} />
         <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-          {screen === 'dashboard' && <Dashboard role={role} user={user} accountRecords={accountRecords} customerUsers={customerUsers} registeredUsers={registeredUsers} onRefreshRegisteredUsers={refreshRegisteredUsers} onPromoteUser={promoteUserToAdmin} />}
-          {screen === 'history' && <History accountRecords={accountRecords} role={role} onMarkBillPaid={markBillPaid} onDeletePaidBill={deletePaidBill} onRefreshBills={refreshBills} />}
+          {billSyncError ? <Text style={styles.error}>{billSyncError}</Text> : null}
+          {screen === 'dashboard' && <Dashboard role={role} user={user} accountRecords={accountRecords} customerUsers={customerUsers} registeredUsers={registeredUsers} onRefreshRegisteredUsers={refreshRegisteredUsers} onSetUserAdminRole={setUserAdminRole} />}
+          {screen === 'history' && <History accountRecords={accountRecords} role={role} onMarkBillPaid={markBillPaid} onRefreshBills={refreshBills} />}
+          {screen === 'monthly-usage' && <MonthlyUsage role={role} user={user} customerUsers={customerUsers} />}
           {screen === 'add-user' && <AddCustomer onSaveCustomer={saveCustomerRecord} />}
-          {screen === 'issue-bill' && <LogBill customerUsers={customerUsers} selectedCustomer={selectedBillingCustomer} onSelectCustomer={setSelectedBillingCustomer} onSaveBill={saveBillRecord} />}
+          {screen === 'log-bill' && <LogBill customerUsers={customerUsers} selectedCustomer={selectedBillingCustomer} onSelectCustomer={setSelectedBillingCustomer} onRecordMeterReading={recordMeterReading} onLogBill={logBillRecord} />}
           {screen === 'profile' && <Profile user={user} onSave={saveProfile} onSignOut={signOut} />}
         </ScrollView>
         {role === roles.ADMIN && screen === 'history' ? (
           <Text style={styles.adminHistoryNote}>Note: This records an offline payment only. BlueBill does not process transactions.</Text>
         ) : null}
+        {role === roles.USER && screen === 'dashboard' ? (
+          <Text style={styles.customerSupportNote}>For further concerns about your bills please contact our customer services at this number 09655375630 or you can also visit at the office.</Text>
+        ) : null}
         <Navigation role={role} screen={screen} onNavigate={(nextScreen) => {
-          if (nextScreen === 'issue-bill') setSelectedBillingCustomer(null);
+          if (nextScreen === 'log-bill') setSelectedBillingCustomer(null);
           setScreen(nextScreen);
         }} />
       </View>
@@ -467,7 +609,7 @@ function Login({ role, onRoleChange, onLogin }) {
       try {
         profileSnapshot = await getDoc(doc(db, 'users', credential.user.uid));
       } catch (error) {
-        throw firestoreAccessError(`your users/${credential.user.uid} profile document`, error);
+        throw await firestoreAccessError(`your users/${credential.user.uid} profile document`, error);
       }
       if (!profileSnapshot.exists()) {
         await firebaseSignOut(auth);
@@ -595,7 +737,7 @@ function Login({ role, onRoleChange, onLogin }) {
           <Field label="Full name" value={name} onChangeText={setName} placeholder="Your full name" />
           <Field label="Email" value={email} onChangeText={setEmail} placeholder="you@example.com" keyboardType="email-address" autoComplete="off" />
           <Field label="Password" value={password} onChangeText={setPassword} placeholder="At least 8 characters" secureTextEntry autoComplete="off" />
-          <Text style={styles.customerLookupHelp}>After registration, an administrator must issue a bill to your email before you can access your bill dashboard.</Text>
+          <Text style={styles.customerLookupHelp}>After registration, an administrator must authorize your email before you can access the customer dashboard.</Text>
           {error ? <Text style={styles.error}>{error}</Text> : null}
           <Button label="Create account" onPress={registerCustomer} />
           <Pressable style={styles.forgotPasswordButton} onPress={() => { setRegistrationMode(false); setError(''); }}>
@@ -907,7 +1049,7 @@ function LegacyDashboard({ role, user, accountRecords, customerAccount, onNaviga
           </View>
         ) : null}
       </Card>
-      <Button label={isAdmin ? 'Issue a bill' : 'View bill history'} onPress={() => onNavigate(isAdmin ? 'issue-bill' : 'history')} secondary />
+      <Button label={isAdmin ? 'Log a bill' : 'View bill history'} onPress={() => onNavigate(isAdmin ? 'log-bill' : 'history')} secondary />
     </View>
   );
 }
@@ -920,7 +1062,7 @@ function billStatus(bill) {
   return bill.status !== 'Overdue' && dueDate < new Date() ? 'Overdue' : (bill.status || 'Pending');
 }
 
-function Dashboard({ role, user, accountRecords, customerUsers, registeredUsers, onRefreshRegisteredUsers, onPromoteUser }) {
+function Dashboard({ role, user, accountRecords, customerUsers, registeredUsers, onRefreshRegisteredUsers, onSetUserAdminRole }) {
   const isAdmin = role === roles.ADMIN;
   const [message, setMessage] = useState('');
   const [refreshingUsers, setRefreshingUsers] = useState(false);
@@ -938,14 +1080,16 @@ function Dashboard({ role, user, accountRecords, customerUsers, registeredUsers,
   const overdueCount = accountRecords.filter((bill) => billStatus(bill) === 'Overdue').length;
   const paidCount = accountRecords.filter((bill) => billStatus(bill) === 'Paid').length;
 
-  async function promoteUser(candidate) {
+  async function changeAdminRole(candidate, makeAdmin) {
     setPromotingUserId(candidate.uid);
     setMessage('');
     try {
-      await onPromoteUser(candidate);
-      setMessage(`${candidate.name || candidate.email || 'Selected user'} is now an administrator and can no longer sign in as a customer.`);
+      await onSetUserAdminRole(candidate, makeAdmin);
+      setMessage(makeAdmin
+        ? `${candidate.name || candidate.email || 'Selected user'} is now an administrator and can no longer sign in as a customer.`
+        : `${candidate.name || candidate.email || 'Selected user'} is now a customer and no longer has administrator access.`);
     } catch (error) {
-      setMessage(error.message || 'Unable to promote this user.');
+      setMessage(error.message || `Unable to ${makeAdmin ? 'add' : 'remove'} administrator access.`);
     } finally {
       setPromotingUserId(null);
     }
@@ -981,34 +1125,48 @@ function Dashboard({ role, user, accountRecords, customerUsers, registeredUsers,
         </View>
       ) : <Text style={styles.title}>{`Hello, ${user?.name?.split(' ')[0] || 'there'}.`}</Text>}
       {isAdmin && addAdminOpen ? (
-        <Card title="Add New Admin" subtitle="Promoted users will only be able to sign in to the admin side.">
+        <Card title="Manage administrator access" subtitle="Admins can sign in only on the admin side. Removing admin access returns an account to customer role.">
           <Field
-            label="Search registered users"
+            label="Search registered accounts"
             value={adminCandidateSearch}
             onChangeText={setAdminCandidateSearch}
             placeholder="Search by name or email"
           />
           <ScrollView style={styles.adminCandidatesList} nestedScrollEnabled showsVerticalScrollIndicator>
-            {filteredAdminCandidates.map((candidate) => (
-              <View style={styles.adminCandidateRow} key={candidate.uid}>
-                <View style={styles.listMain}>
-                  <Text style={styles.listTitle}>{candidate.name || 'Customer'}</Text>
-                  <Text style={styles.listSubtitle}>{candidate.email}</Text>
+            {filteredAdminCandidates.map((candidate) => {
+              const isAdminAccount = candidate.role === roles.ADMIN;
+              const isCurrentAdmin = candidate.uid === user?.uid;
+              return (
+                <View style={styles.adminCandidateRow} key={candidate.uid}>
+                  <View style={styles.listMain}>
+                    <Text style={styles.listTitle}>{candidate.name || 'Customer'}</Text>
+                    <Text style={styles.listSubtitle}>{candidate.email}</Text>
+                  </View>
+                  <View style={styles.adminRoleActions}>
+                    <Text style={[styles.adminRoleLabel, isAdminAccount && styles.adminRoleLabelActive]}>
+                      {isAdminAccount ? 'Admin' : 'Customer'}
+                    </Text>
+                    <Pressable
+                      accessibilityRole="button"
+                      style={[
+                        isAdminAccount ? styles.removeAdminAction : styles.requestAction,
+                        (promotingUserId === candidate.uid || (isAdminAccount && isCurrentAdmin)) && styles.disabledAction
+                      ]}
+                      onPress={() => changeAdminRole(candidate, !isAdminAccount)}
+                      disabled={promotingUserId !== null || (isAdminAccount && isCurrentAdmin)}
+                    >
+                      <Text style={isAdminAccount ? styles.removeAdminActionText : styles.requestActionText}>
+                        {promotingUserId === candidate.uid ? 'Saving...' : isAdminAccount ? isCurrentAdmin ? 'You' : 'Remove admin' : 'Make admin'}
+                      </Text>
+                    </Pressable>
+                  </View>
                 </View>
-                <Pressable
-                  accessibilityRole="button"
-                  style={[styles.requestAction, promotingUserId === candidate.uid && styles.disabledAction]}
-                  onPress={() => promoteUser(candidate)}
-                  disabled={promotingUserId !== null}
-                >
-                  <Text style={styles.requestActionText}>{promotingUserId === candidate.uid ? 'Adding...' : 'Make admin'}</Text>
-                </Pressable>
-              </View>
-            ))}
+              );
+            })}
           </ScrollView>
-          {!registeredUsers.length ? <Text style={styles.emptyState}>There are no registered customer accounts to promote.</Text> : null}
-          {registeredUsers.length > 0 && !filteredAdminCandidates.length ? <Text style={styles.emptyState}>No registered users match that search.</Text> : null}
-          {message ? <Text style={message.includes('now an administrator') ? styles.success : styles.error}>{message}</Text> : null}
+          {!registeredUsers.length ? <Text style={styles.emptyState}>There are no registered accounts.</Text> : null}
+          {registeredUsers.length > 0 && !filteredAdminCandidates.length ? <Text style={styles.emptyState}>No registered accounts match that search.</Text> : null}
+          {message ? <Text style={message.includes('now an administrator') || message.includes('no longer has administrator access') ? styles.success : styles.error}>{message}</Text> : null}
         </Card>
       ) : null}
       <Text style={styles.muted}>{isAdmin ? 'Manage customer authorization separately from issuing consumption bills.' : 'Bills issued to your account appear here.'}</Text>
@@ -1045,16 +1203,17 @@ function Dashboard({ role, user, accountRecords, customerUsers, registeredUsers,
                       <Text style={styles.listTitle}>{registeredUser.name || 'Customer'}</Text>
                       <Text style={styles.listSubtitle}>{registeredUser.email}</Text>
                       <Text style={styles.customerLookupHelp}>
-                        {authorizedCustomer
-                          ? `Customer number: ${authorizedCustomer.customerNumber}`
-                          : 'Not yet authorized by an admin'}
+                        Location: {registeredUser.city || authorizedCustomer?.city || 'Not provided'}
+                      </Text>
+                      <Text style={styles.customerLookupHelp}>
+                        {authorizedCustomer ? `Customer number: ${authorizedCustomer.customerNumber}` : 'Not yet authorized by an admin'}
                       </Text>
                     </View>
                   </View>
                 );
               })}
             </ScrollView>
-            {!registeredUsers.length ? <Text style={styles.emptyState}>No customer accounts have registered yet.</Text> : null}
+            {!registeredUsers.length ? <Text style={styles.emptyState}>No registered accounts have been found.</Text> : null}
             {registeredUsers.length > 0 && !filteredRegisteredUsers.length ? <Text style={styles.emptyState}>No users match that name.</Text> : null}
           </Card>
         </>
@@ -1062,12 +1221,15 @@ function Dashboard({ role, user, accountRecords, customerUsers, registeredUsers,
         <>
           <Card title="Pending bills" subtitle="Payment is handled outside BlueBill; status is maintained by administrators">
             {accountRecords.filter((bill) => billStatus(bill) === 'Pending' || billStatus(bill) === 'Overdue').map((bill) => (
-              <View style={styles.historyRow} key={bill.id}>
-                <View style={styles.listMain}>
-                  <Text style={styles.listTitle}>{bill.id}</Text>
-                  <Text style={styles.listSubtitle}>Due {bill.dueDate} · {billStatus(bill)}</Text>
+              <View style={styles.pendingBillRow} key={bill.id}>
+                <View style={styles.historyRow}>
+                  <View style={styles.listMain}>
+                    <Text style={styles.listTitle}>{bill.id}</Text>
+                    <Text style={styles.listSubtitle}>Due {bill.dueDate} · {billStatus(bill)}</Text>
+                  </View>
+                  <Text style={styles.amount}>₱{Number(bill.bill).toFixed(2)}</Text>
                 </View>
-                <Text style={styles.amount}>₱{Number(bill.bill).toFixed(2)}</Text>
+                <BillReceiptDownload bill={bill} />
               </View>
             ))}
             {!accountRecords.some((bill) => billStatus(bill) === 'Pending' || billStatus(bill) === 'Overdue') ? <Text style={styles.emptyState}>You have no pending bills.</Text> : null}
@@ -1079,11 +1241,9 @@ function Dashboard({ role, user, accountRecords, customerUsers, registeredUsers,
   );
 }
 
-function History({ accountRecords, role, onMarkBillPaid, onDeletePaidBill, onRefreshBills }) {
+function History({ accountRecords, role, onMarkBillPaid, onRefreshBills }) {
   const isAdmin = role === roles.ADMIN;
   const [message, setMessage] = useState('');
-  const [deleteConfirmationId, setDeleteConfirmationId] = useState(null);
-  const [deletingBillId, setDeletingBillId] = useState(null);
 
   useEffect(() => {
     let isActive = true;
@@ -1104,20 +1264,6 @@ function History({ accountRecords, role, onMarkBillPaid, onDeletePaidBill, onRef
     }
   }
 
-  async function deletePaidBill(bill) {
-    if (deletingBillId) return;
-    setDeletingBillId(bill.id);
-    setMessage('');
-    try {
-      await onDeletePaidBill(bill);
-      setDeleteConfirmationId(null);
-    } catch (error) {
-      setMessage(error.message || 'Unable to delete this paid bill.');
-    } finally {
-      setDeletingBillId(null);
-    }
-  }
-
   return (
     <View>
       <Text style={styles.eyebrow}>ACTIVITY</Text>
@@ -1127,49 +1273,125 @@ function History({ accountRecords, role, onMarkBillPaid, onDeletePaidBill, onRef
         {accountRecords
           .filter((bill) => isAdmin || billStatus(bill) === 'Paid' || billStatus(bill) === 'Overdue')
           .map((bill) => (
-            <View style={styles.historyRow} key={bill.id}>
-              <View style={styles.listMain}>
-                <Text style={styles.listTitle}>{isAdmin ? `${bill.id} · ${bill.name}` : bill.id}</Text>
-                <Text style={styles.listSubtitle}>{billStatus(bill)} · Due {bill.dueDate}</Text>
+            <View style={styles.pendingBillRow} key={bill.id}>
+              <View style={styles.historyRow}>
+                <View style={styles.listMain}>
+                  <Text style={styles.listTitle}>{isAdmin ? `${bill.id} · ${bill.name}` : bill.id}</Text>
+                  <Text style={styles.listSubtitle}>{billStatus(bill)} · Due {bill.dueDate}</Text>
+                </View>
+                <Text style={styles.amount}>₱{Number(bill.bill).toFixed(2)}</Text>
               </View>
-              <Text style={styles.amount}>₱{Number(bill.bill).toFixed(2)}</Text>
+              {!isAdmin ? <BillReceiptDownload bill={bill} /> : null}
               {isAdmin && billStatus(bill) !== 'Paid' ? (
                 <Pressable style={styles.requestAction} onPress={() => markBillPaid(bill)}>
                   <Text style={styles.requestActionText}>Record paid</Text>
                 </Pressable>
-              ) : null}
-              {!isAdmin && billStatus(bill) === 'Paid' ? (
-                deleteConfirmationId === bill.id ? (
-                  <View style={styles.requestActions}>
-                    <Pressable
-                      style={styles.requestRejectAction}
-                      onPress={() => deletePaidBill(bill)}
-                      disabled={deletingBillId === bill.id}
-                    >
-                      <Text style={styles.requestRejectText}>{deletingBillId === bill.id ? 'Deleting...' : 'Confirm delete'}</Text>
-                    </Pressable>
-                    <Pressable
-                      style={styles.requestAction}
-                      onPress={() => setDeleteConfirmationId(null)}
-                      disabled={deletingBillId === bill.id}
-                    >
-                      <Text style={styles.requestActionText}>Cancel</Text>
-                    </Pressable>
-                  </View>
-                ) : (
-                  <Pressable
-                    style={styles.requestRejectAction}
-                    onPress={() => setDeleteConfirmationId(bill.id)}
-                  >
-                    <Text style={styles.requestRejectText}>Delete</Text>
-                  </Pressable>
-                )
               ) : null}
             </View>
           ))}
         {!accountRecords.some((bill) => isAdmin || billStatus(bill) === 'Paid' || billStatus(bill) === 'Overdue') ? <Text style={styles.emptyState}>No bill history yet.</Text> : null}
       </Card>
       {message ? <Text style={styles.error}>{message}</Text> : null}
+    </View>
+  );
+}
+
+function BillReceiptDownload({ bill }) {
+  const [downloading, setDownloading] = useState(false);
+  const [error, setError] = useState('');
+
+  async function downloadReceipt() {
+    if (downloading) return;
+    if (typeof document === 'undefined') {
+      setError('Receipt downloads are only available in the web app.');
+      return;
+    }
+    setDownloading(true);
+    setError('');
+    try {
+      const previousReading = Number(bill.previousReading);
+      const currentReading = Number(bill.currentReading);
+      const hasReadings = Number.isFinite(previousReading) && Number.isFinite(currentReading);
+      const consumption = hasReadings ? Math.max(0, currentReading - previousReading) : null;
+      const amount = Number(bill.bill);
+      const issuedAt = bill.issuedAt?.toDate ? bill.issuedAt.toDate() : new Date(bill.issuedAt);
+      const issueDate = Number.isNaN(issuedAt.getTime())
+        ? 'Not available'
+        : issuedAt.toLocaleDateString('en-PH', { year: 'numeric', month: 'long', day: 'numeric' });
+      const qrPayload = JSON.stringify({
+        billId: bill.id,
+        customerNumber: bill.customerNumber || '',
+        status: billStatus(bill),
+        amount: Number.isFinite(amount) ? amount.toFixed(2) : '0.00',
+        consumptionM3: consumption,
+        issuedAt: issueDate
+      });
+      const qrCode = await QRCode.toDataURL(qrPayload, { errorCorrectionLevel: 'M', margin: 1, width: 240 });
+      const pdf = new jsPDF({ unit: 'mm', format: 'a4' });
+      pdf.setFont('helvetica', 'bold');
+      pdf.setFontSize(22);
+      pdf.setTextColor(56, 102, 255);
+      pdf.text('BlueBill', 20, 22);
+      pdf.setFontSize(11);
+      pdf.setTextColor(100, 116, 139);
+      pdf.setFont('helvetica', 'normal');
+      pdf.text('Water billing tracker · Bill receipt', 20, 30);
+      pdf.setDrawColor(229, 234, 243);
+      pdf.line(20, 36, 190, 36);
+      pdf.setTextColor(17, 24, 39);
+      pdf.setFontSize(16);
+      pdf.setFont('helvetica', 'bold');
+      pdf.text(bill.id || 'Bill receipt', 20, 49);
+      pdf.setFontSize(11);
+      pdf.setFont('helvetica', 'normal');
+      const details = [
+        ['Customer', bill.name || 'Customer'],
+        ['Customer number', bill.customerNumber || 'Not available'],
+        ['Status', billStatus(bill)],
+        ['Date issued', issueDate],
+        ['Due date', bill.dueDate || 'Not available'],
+        ['Previous meter reading', hasReadings ? `${previousReading.toLocaleString()} m3` : 'Not available'],
+        ['Current meter reading', hasReadings ? `${currentReading.toLocaleString()} m3` : 'Not available'],
+        ['Water consumed', consumption === null ? 'Not available' : `${consumption.toLocaleString()} m3`]
+      ];
+      details.forEach(([label, value], index) => {
+        const y = 63 + index * 11;
+        pdf.setTextColor(100, 116, 139);
+        pdf.text(label, 20, y);
+        pdf.setTextColor(17, 24, 39);
+        pdf.text(String(value), 80, y);
+      });
+      pdf.setDrawColor(229, 234, 243);
+      pdf.line(20, 158, 190, 158);
+      pdf.setFont('helvetica', 'bold');
+      pdf.setFontSize(14);
+      pdf.setTextColor(17, 24, 39);
+      pdf.text(`Amount due: PHP ${Number.isFinite(amount) ? amount.toFixed(2) : '0.00'}`, 20, 172);
+      pdf.addImage(qrCode, 'PNG', 20, 184, 42, 42);
+      pdf.setFont('helvetica', 'normal');
+      pdf.setFontSize(9);
+      pdf.setTextColor(100, 116, 139);
+      pdf.text('Scan for bill details', 20, 231);
+      pdf.text('This receipt records the water usage billed by the administrator.', 20, 245);
+      pdf.save(`${bill.id || 'bluebill-receipt'}-receipt.pdf`);
+    } catch (downloadError) {
+      setError(downloadError.message || 'Unable to download the bill receipt.');
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  return (
+    <View style={styles.receiptDownloadWrap}>
+      <Pressable
+        accessibilityRole="button"
+        style={[styles.requestAction, downloading && styles.disabledAction]}
+        onPress={downloadReceipt}
+        disabled={downloading}
+      >
+        <Text style={styles.requestActionText}>{downloading ? 'Preparing receipt...' : 'Download bill receipt (PDF)'}</Text>
+      </Pressable>
+      {error ? <Text style={styles.receiptError}>{error}</Text> : null}
     </View>
   );
 }
@@ -1193,7 +1415,7 @@ function AddCustomer({ onSaveCustomer }) {
     try {
       const customer = await onSaveCustomer({ name: name.trim(), email: email.trim().toLowerCase() });
       setCustomerNumber(customer.customerNumber);
-      setMessage('Customer added. Share the customer number with them. Issue water bills separately from the Issue bill screen.');
+      setMessage('Customer added. Share the customer number with them. Record readings and log bills from the Log bill screen.');
       setName('');
       setEmail('');
     } catch (error) {
@@ -1219,42 +1441,69 @@ function AddCustomer({ onSaveCustomer }) {
   );
 }
 
-function LogBill({ customerUsers, selectedCustomer, onSelectCustomer, onSaveBill }) {
-  const [location, setLocation] = useState('');
-  const [billAmount, setBillAmount] = useState('');
+function LogBill({ customerUsers, selectedCustomer, onSelectCustomer, onRecordMeterReading, onLogBill }) {
+  const [meterReading, setMeterReading] = useState('');
   const [customerSearch, setCustomerSearch] = useState('');
   const [message, setMessage] = useState('');
-  const [issuedBillNumber, setIssuedBillNumber] = useState('');
+  const [messageIsSuccess, setMessageIsSuccess] = useState(false);
+  const [loggedBill, setLoggedBill] = useState(null);
   const [saving, setSaving] = useState(false);
   const filteredCustomers = customerUsers.filter((customer) =>
     (customer.name || 'Customer').toLowerCase().includes(customerSearch.trim().toLowerCase())
   );
+  const activeCustomer = customerUsers.find((customer) => customer.id === selectedCustomer?.id) || selectedCustomer;
+  const hasStartingReading = activeCustomer?.cycleStartReading !== undefined
+    && activeCustomer?.currentReading !== undefined;
+  const currentUsage = hasStartingReading ? getActiveCustomerUsage(activeCustomer) : null;
+  const billAmount = currentUsage === null ? 0 : currentUsage * waterRatePerCubicMeter;
 
-  async function saveBill() {
+  useEffect(() => {
+    setMeterReading('');
+    setMessage('');
+    setMessageIsSuccess(false);
+    setLoggedBill(null);
+  }, [selectedCustomer?.id]);
+
+  async function saveMeterReading() {
     if (saving) return;
-    const amount = Number(billAmount);
-    if (!selectedCustomer || !location.trim() || !billAmount.trim()) {
-      setMessage('Select an authorized customer, enter the service location, and enter the bill amount.');
+    const reading = Number(meterReading);
+    if (!activeCustomer || !meterReading.trim() || !Number.isFinite(reading) || reading < 0) {
+      setMessage('Enter a valid meter reading of zero or more.');
       return;
     }
-    if (!Number.isFinite(amount) || amount <= 0) {
-      setMessage('Enter a bill amount greater than ₱0.00.');
+    if (hasStartingReading && reading < Number(activeCustomer.currentReading)) {
+      setMessage('The new meter reading cannot be lower than the previously recorded reading.');
       return;
     }
     setSaving(true);
     setMessage('');
-    setIssuedBillNumber('');
+    setLoggedBill(null);
     try {
-      const billNumber = await onSaveBill({
-        customer: selectedCustomer.name,
-        email: selectedCustomer.email,
-        location: location.trim(),
-        amount
-      });
-      setIssuedBillNumber(billNumber);
-      setMessage('Bill issued and available in the customer dashboard.');
+      await onRecordMeterReading(activeCustomer, reading);
+      setMeterReading('');
+      setMessage(hasStartingReading ? 'Meter reading saved. Monthly usage is updated.' : 'Starting meter reading saved. Usage will accrue from the next reading.');
+      setMessageIsSuccess(true);
     } catch (error) {
-      setMessage(error.message || 'Unable to save bill permanently.');
+      setMessage(error.message || 'Unable to save the meter reading.');
+      setMessageIsSuccess(false);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function logBill() {
+    if (saving || !activeCustomer) return;
+    setSaving(true);
+    setMessage('');
+    setLoggedBill(null);
+    try {
+      const bill = await onLogBill(activeCustomer);
+      setLoggedBill(bill);
+      setMessage('Pending bill logged. The customer’s usage cycle has reset.');
+      setMessageIsSuccess(true);
+    } catch (error) {
+      setMessage(error.message || 'Unable to log the bill.');
+      setMessageIsSuccess(false);
     } finally {
       setSaving(false);
     }
@@ -1263,8 +1512,8 @@ function LogBill({ customerUsers, selectedCustomer, onSelectCustomer, onSaveBill
   return (
     <View>
       <Text style={styles.eyebrow}>ADMIN TOOL</Text>
-      <Text style={styles.title}>Issue bill</Text>
-      <Text style={styles.muted}>Create a pending water-consumption bill for an authorized customer. Customer authorization is managed separately in Add user.</Text>
+      <Text style={styles.title}>Log bill</Text>
+      <Text style={styles.muted}>Record meter readings as they are received. Log bill finalizes the customer's accumulated usage, creates a pending bill, and starts a new usage cycle.</Text>
       <Card>
         {customerUsers.length ? (
           <View>
@@ -1275,23 +1524,121 @@ function LogBill({ customerUsers, selectedCustomer, onSelectCustomer, onSaveBill
               nestedScrollEnabled
               showsVerticalScrollIndicator
             >
-              {filteredCustomers.map((account) => (
-                <Pressable key={account.id} style={[styles.customerOption, selectedCustomer?.id === account.id && styles.customerOptionActive]} onPress={() => { onSelectCustomer(account); setMessage(''); }}>
-                  <Text style={styles.listTitle}>{account.name || 'Customer'} · {account.customerNumber}</Text>
-                  <Text style={styles.listSubtitle}>{account.email}</Text>
-                </Pressable>
-              ))}
+              {filteredCustomers.map((customer) => {
+                const isSelected = activeCustomer?.id === customer.id;
+                return (
+                  <Pressable key={customer.id} style={[styles.customerOption, isSelected && styles.customerOptionActive]} onPress={() => { onSelectCustomer(customer); setMessage(''); setMessageIsSuccess(false); setLoggedBill(null); }}>
+                    <Text style={styles.listTitle}>{customer.name || 'Customer'} · {customer.customerNumber}</Text>
+                    <Text style={styles.listSubtitle}>{customer.email}</Text>
+                    <Text style={styles.usageReadingDetail}>Location: {customer.city || 'Not provided'}</Text>
+                    {isSelected ? (
+                      <Text style={styles.listSubtitle}>
+                        {getActiveCustomerUsage(customer) === null ? 'Starting reading not set' : `Current usage: ${getActiveCustomerUsage(customer).toLocaleString()} m³`}
+                      </Text>
+                    ) : null}
+                  </Pressable>
+                );
+              })}
             </ScrollView>
             {!filteredCustomers.length ? <Text style={styles.emptyState}>No authorized customers match that name.</Text> : null}
           </View>
         ) : null}
-        {!customerUsers.length ? <Text style={styles.emptyState}>Add an authorized customer before issuing a bill.</Text> : null}
-        {selectedCustomer ? <Text style={styles.customerLookupDetails}>Billing {selectedCustomer.name} ({selectedCustomer.email}) · {selectedCustomer.customerNumber}</Text> : null}
-        <Field label="Location" value={location} onChangeText={setLocation} placeholder="Barangay, city, or service address" />
-        <Field label="Bill amount (₱)" value={billAmount} onChangeText={setBillAmount} placeholder="0.00" keyboardType="decimal-pad" />
-        {issuedBillNumber ? <Text style={styles.success}>Issued bill number: {issuedBillNumber}</Text> : null}
-        {message ? <Text style={issuedBillNumber ? styles.success : styles.error}>{message}</Text> : null}
-        <Button label={saving ? 'Saving...' : 'Issue pending bill'} onPress={saveBill} />
+        {!customerUsers.length ? <Text style={styles.emptyState}>Add an authorized customer before recording meter readings.</Text> : null}
+        {activeCustomer ? (
+          <>
+            <Text style={styles.customerLookupDetails}>Customer: {activeCustomer.name} ({activeCustomer.email}) · {activeCustomer.customerNumber}</Text>
+            <Field
+              label={hasStartingReading ? 'New meter reading (m³)' : 'Starting meter reading (m³)'}
+              value={meterReading}
+              onChangeText={setMeterReading}
+              placeholder={hasStartingReading ? String(activeCustomer.currentReading) : 'Enter current meter value'}
+              keyboardType="decimal-pad"
+            />
+            <Button
+              label={saving ? 'Saving...' : hasStartingReading ? 'Record meter reading' : 'Set starting reading'}
+              onPress={saveMeterReading}
+              disabled={saving}
+            />
+            <View style={styles.calculationBox}>
+              <Text style={styles.calculationTitle}>Current cycle usage</Text>
+              <Text style={styles.calculationText}>Water used = current meter reading − last billed meter reading</Text>
+              <Text style={styles.calculationText}>
+                {hasStartingReading
+                  ? `${Number(activeCustomer.currentReading).toLocaleString()} − ${Number(activeCustomer.cycleStartReading).toLocaleString()} = ${currentUsage.toLocaleString()} m³`
+                  : 'Set a starting reading, then record readings to build usage.'}
+              </Text>
+              <Text style={styles.calculationAmount}>Pending bill amount at ₱{waterRatePerCubicMeter}/m³: ₱{billAmount.toFixed(2)}</Text>
+            </View>
+            <Button label={saving ? 'Saving...' : 'Log bill'} onPress={logBill} disabled={saving || currentUsage === null || currentUsage <= 0} />
+          </>
+        ) : null}
+        {loggedBill ? <Text style={styles.success}>Bill {loggedBill.id} · ₱{Number(loggedBill.bill).toFixed(2)} pending.</Text> : null}
+        {message ? <Text style={messageIsSuccess ? styles.success : styles.error}>{message}</Text> : null}
+      </Card>
+    </View>
+  );
+}
+
+function MonthlyUsage({ role, user, customerUsers }) {
+  const isAdmin = role === roles.ADMIN;
+  const totalUsage = customerUsers.reduce((total, customer) => total + (getActiveCustomerUsage(customer) || 0), 0);
+
+  if (!isAdmin) {
+    const customer = customerUsers.find((item) => item.email?.toLowerCase() === user?.email?.toLowerCase());
+    const usage = customer ? getActiveCustomerUsage(customer) : null;
+    const billEstimate = usage === null ? 0 : usage * waterRatePerCubicMeter;
+    return (
+      <View>
+        <Text style={styles.eyebrow}>CUSTOMER USAGE</Text>
+        <Text style={styles.title}>Current Monthly Usage</Text>
+        <Text style={styles.muted}>Current billing cycle · Usage updates live when your administrator records a meter reading and resets when a bill is logged.</Text>
+        <View style={styles.metricsRow}>
+          <Metric label="Water used this cycle" value={`${(usage || 0).toLocaleString()} m³`} />
+          <Metric label="Estimated bill" value={`₱${billEstimate.toFixed(2)}`} note={`₱${waterRatePerCubicMeter} per m³`} />
+        </View>
+        <Card title="Live meter readings" subtitle="Water used = current meter reading − last billed meter reading">
+          {customer && usage !== null ? (
+            <>
+              <Detail label="Last billed reading" value={`${Number(customer.cycleStartReading).toLocaleString()} m³`} />
+              <Detail label="Current reading" value={`${Number(customer.currentReading).toLocaleString()} m³`} />
+              <Detail label="Current usage" value={`${usage.toLocaleString()} m³`} />
+              <Text style={styles.usageReadingDetail}>
+                {customer.meterReadingUpdatedAt ? `Last updated ${new Date(customer.meterReadingUpdatedAt).toLocaleString('en-PH')}` : 'Waiting for meter reading updates.'}
+              </Text>
+            </>
+          ) : <Text style={styles.emptyState}>Your administrator has not recorded a starting meter reading yet.</Text>}
+        </Card>
+      </View>
+    );
+  }
+
+  const customerUsageRows = [...customerUsers].sort((first, second) => (first.name || '').localeCompare(second.name || ''));
+  return (
+    <View>
+      <Text style={styles.eyebrow}>ADMIN REPORT</Text>
+      <Text style={styles.title}>Current Monthly Usage</Text>
+      <Text style={styles.muted}>Live current-cycle usage across authorized customers. Logging a bill finalizes that cycle and resets usage to zero.</Text>
+      <View style={styles.metricsRow}>
+        <Metric label="Total water used" value={`${totalUsage.toLocaleString()} m³`} />
+        <Metric label="Customers with readings" value={customerUsageRows.filter((customer) => getActiveCustomerUsage(customer) !== null).length.toLocaleString()} />
+      </View>
+      <Card title="Customer usage this cycle" subtitle="Usage is calculated from the latest meter reading and last billed reading">
+        {customerUsageRows.map((customer) => {
+          const usage = getActiveCustomerUsage(customer);
+          return (
+            <View style={styles.usageCustomerRow} key={customer.email}>
+              <View style={styles.listMain}>
+                <Text style={styles.listTitle}>{customer.name}</Text>
+                <Text style={styles.listSubtitle}>{customer.customerNumber} · {customer.email}</Text>
+                {usage !== null
+                  ? <Text style={styles.usageReadingDetail}>Last billed {Number(customer.cycleStartReading).toLocaleString()} m³ · Current reading {Number(customer.currentReading).toLocaleString()} m³</Text>
+                  : <Text style={styles.usageReadingDetail}>No starting meter reading recorded.</Text>}
+              </View>
+              <Text style={styles.amount}>{usage === null ? '—' : `${usage.toLocaleString()} m³`}</Text>
+            </View>
+          );
+        })}
+        {!customerUsageRows.length ? <Text style={styles.emptyState}>No authorized customers are available.</Text> : null}
       </Card>
     </View>
   );
@@ -1335,8 +1682,8 @@ function Profile({ user, onSave, onSignOut }) {
 
 function Navigation({ role, screen, onNavigate }) {
   const items = role === roles.ADMIN
-    ? [['dashboard', 'Home'], ['add-user', 'Add user'], ['issue-bill', 'Issue bill'], ['history', 'History']]
-    : [['dashboard', 'Home'], ['history', 'Bill history']];
+    ? [['dashboard', 'Home'], ['add-user', 'Add user'], ['log-bill', 'Log bill'], ['history', 'History'], ['monthly-usage', 'Monthly usage']]
+    : [['dashboard', 'Home'], ['history', 'Bill history'], ['monthly-usage', 'Monthly usage']];
   return (
     <View style={styles.navigation}>
       {items.map(([target, label]) => (
@@ -1356,7 +1703,7 @@ function Metric({ label, value, note }) { return <View style={styles.metric}><Te
 function Detail({ label, value }) { return <View style={styles.detail}><Text style={styles.listSubtitle}>{label}</Text><Text style={styles.detailValue}>{value}</Text></View>; }
 function StatusPill({ label }) { return <View style={styles.status}><Text style={styles.statusText}>{label}</Text></View>; }
 function Field({ label, ...props }) { const textScale = useTextScale(); return <View style={styles.field}><Text style={styles.fieldLabel}>{label}</Text><TextInput {...props} style={[styles.input, { fontSize: Math.round(16 * textScale) }]} placeholderTextColor={colors.muted} /></View>; }
-function Button({ label, onPress, secondary = false }) { return <Pressable style={[styles.button, secondary && styles.buttonSecondary]} onPress={onPress}><Text style={[styles.buttonText, secondary && styles.buttonTextSecondary]}>{label}</Text></Pressable>; }
+function Button({ label, onPress, secondary = false, disabled = false }) { return <Pressable disabled={disabled} style={[styles.button, secondary && styles.buttonSecondary, disabled && styles.disabledButton]} onPress={onPress}><Text style={[styles.buttonText, secondary && styles.buttonTextSecondary]}>{label}</Text></Pressable>; }
 
 const colors = { background: '#f4f6fb', surface: '#ffffff', border: '#e5eaf3', text: '#111827', muted: '#64748b', primary: '#3866ff', primarySoft: '#ebf1ff', success: '#15803d' };
 
@@ -1376,6 +1723,11 @@ const styles = StyleSheet.create({
   addAdminArrow: { color: colors.primary, fontSize: 14, fontWeight: '900' },
   adminCandidatesList: { maxHeight: 280 },
   adminCandidateRow: { flexDirection: 'row', alignItems: 'center', gap: 10, borderBottomWidth: 1, borderBottomColor: '#eef1f6', paddingVertical: 10 },
+  adminRoleActions: { alignItems: 'flex-end', gap: 6 },
+  adminRoleLabel: { color: colors.muted, fontSize: 12, fontWeight: '700' },
+  adminRoleLabelActive: { color: colors.primary },
+  removeAdminAction: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 9, backgroundColor: '#fee2e2' },
+  removeAdminActionText: { color: '#b91c1c', fontWeight: '800', fontSize: 13 },
   disabledAction: { opacity: 0.55 },
   splashTitle: { color: colors.text, fontSize: 40, fontWeight: '800', marginBottom: 8, textAlign: 'center' },
   muted: { color: colors.muted, fontSize: 16, lineHeight: 24, marginBottom: 20 },
@@ -1409,6 +1761,11 @@ const styles = StyleSheet.create({
   calculationTitle: { color: colors.text, fontWeight: '800', marginBottom: 8 },
   calculationText: { color: colors.muted, fontSize: 14, marginBottom: 4 },
   calculationAmount: { color: colors.text, fontWeight: '900', fontSize: 18, marginTop: 6 },
+  usageCustomerRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#eef1f6' },
+  usageReadingDetail: { color: colors.muted, fontSize: 12, marginTop: 4 },
+  pendingBillRow: { borderBottomWidth: 1, borderBottomColor: '#eef1f6', paddingBottom: 10, marginBottom: 6 },
+  receiptDownloadWrap: { alignItems: 'flex-start', paddingBottom: 6 },
+  receiptError: { color: '#dc2626', fontSize: 12, marginTop: 2 },
   forgotPasswordButton: { alignItems: 'center', paddingVertical: 10 },
   forgotPasswordText: { color: colors.primary, fontWeight: '800', fontSize: 14 },
   authHint: { color: colors.muted, textAlign: 'center', fontSize: 14, marginVertical: 10 },
@@ -1417,6 +1774,7 @@ const styles = StyleSheet.create({
   verificationNotice: { color: colors.muted, fontSize: 14, lineHeight: 21, marginBottom: 16 },
   demoCode: { color: colors.primary, backgroundColor: colors.primarySoft, borderRadius: 10, padding: 12, textAlign: 'center', fontWeight: '800', marginBottom: 8 },
   button: { backgroundColor: colors.primary, paddingVertical: 15, paddingHorizontal: 18, borderRadius: 13, alignItems: 'center', marginTop: 8, marginBottom: 12 },
+  disabledButton: { opacity: 0.5 },
   buttonSecondary: { backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border },
   buttonText: { color: '#ffffff', fontWeight: '800', fontSize: 16 },
   buttonTextSecondary: { color: colors.primary },
@@ -1519,11 +1877,8 @@ const styles = StyleSheet.create({
   registeredUsersList: { maxHeight: 270 },
   customerOption: { paddingVertical: 10, paddingHorizontal: 12, marginBottom: 6, borderRadius: 10, borderWidth: 1, borderColor: colors.border, backgroundColor: '#f8fafc' },
   customerOptionActive: { backgroundColor: colors.primarySoft, borderColor: colors.primary },
-  requestActions: { flexDirection: 'row', gap: 8 },
   requestAction: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 9, backgroundColor: colors.primarySoft },
   requestActionText: { color: colors.primary, fontWeight: '800', fontSize: 13 },
-  requestRejectAction: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 9, backgroundColor: '#fee2e2' },
-  requestRejectText: { color: '#991b1b', fontWeight: '800', fontSize: 13 },
   divider: { height: 1, backgroundColor: colors.border, marginVertical: 12 },
   detail: { paddingVertical: 10, flexDirection: 'row', justifyContent: 'space-between', gap: 12 },
   detailValue: { color: colors.text, fontWeight: '700', flexShrink: 1, textAlign: 'right' },
@@ -1531,6 +1886,7 @@ const styles = StyleSheet.create({
   statusText: { color: '#c2410c', fontWeight: '800', fontSize: 12 },
   navigation: { flexDirection: 'row', borderTopWidth: 1, borderTopColor: colors.border, backgroundColor: colors.surface, paddingHorizontal: 4, paddingTop: 8, paddingBottom: 6 },
   adminHistoryNote: { color: colors.muted, fontSize: 12, lineHeight: 18, paddingHorizontal: 22, paddingTop: 6, paddingBottom: 8, backgroundColor: colors.background },
+  customerSupportNote: { color: colors.muted, fontSize: 12, lineHeight: 18, paddingHorizontal: 22, paddingTop: 6, paddingBottom: 8, backgroundColor: colors.background },
   navItem: { flex: 1, alignItems: 'center', paddingVertical: 8 },
   navLabel: { color: colors.muted, fontSize: 12, fontWeight: '700' },
   navLabelActive: { color: colors.primary }
