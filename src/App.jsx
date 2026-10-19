@@ -576,8 +576,8 @@ function Splash({ onStart }) {
       <View style={styles.splash}>
         <View style={styles.splashPanel}>
           <Image source={logo} style={styles.heroLogo} resizeMode="contain" />
-          <Text style={styles.splashTitle}>Water billing, made clear.</Text>
-          <Text style={styles.mutedCenter}>Streamlined billing for customers and teams.</Text>
+          <Text style={styles.splashTitle}>Water Bills Receipt Made it clear</Text>
+          <Text style={styles.mutedCenter}>Streamline Bills receipt for customers and teams</Text>
           <Button label="Start now" onPress={onStart} />
         </View>
       </View>
