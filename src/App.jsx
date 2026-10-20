@@ -22,7 +22,12 @@ import { auth, db } from '../firebaseConfig';
 
 
 const roles = { ADMIN: 'admin', USER: 'user' };
+const protectedAdminEmail = 'bluebillproject@gmail.com';
 const waterRatePerCubicMeter = 30;
+
+function isProtectedAdminProfile(profile) {
+  return profile?.email?.trim().toLowerCase() === protectedAdminEmail;
+}
 
 async function loadBillsForUser(firebaseUser, isAdmin) {
   const billsCollection = collection(db, 'bills');
@@ -161,8 +166,8 @@ function getActiveCustomerUsage(customer) {
   if (customer.cycleStartReading === undefined || customer.currentReading === undefined) return null;
   const cycleStartReading = Number(customer.cycleStartReading);
   const currentReading = Number(customer.currentReading);
-  if (!Number.isFinite(cycleStartReading) || !Number.isFinite(currentReading) || currentReading < cycleStartReading) return null;
-  return currentReading - cycleStartReading;
+  if (!Number.isFinite(cycleStartReading) || !Number.isFinite(currentReading)) return null;
+  return Math.max(0, currentReading - cycleStartReading);
 }
 
 function getAdminSummary(accountRecords) {
@@ -285,33 +290,25 @@ export default function App() {
     }
   }
 
-  async function recordMeterReading(customer, reading) {
+  async function recordMeterReading(customer, lastReading, reading) {
     if (role !== roles.ADMIN || !auth.currentUser) {
       throw new Error('Only a signed-in administrator can record a meter reading.');
     }
-    if (!Number.isFinite(reading) || reading < 0) throw new Error('Enter a valid meter reading of zero or more.');
+    if (!Number.isFinite(lastReading) || lastReading < 0 || !Number.isFinite(reading) || reading < 0) {
+      throw new Error('Enter valid meter readings of zero or more.');
+    }
     try {
       await runTransaction(db, async (transaction) => {
         const customerReference = doc(db, 'customers', customer.id);
         const customerSnapshot = await transaction.get(customerReference);
         if (!customerSnapshot.exists()) throw new Error('This customer record no longer exists. Refresh and try again.');
-        const currentCustomer = customerSnapshot.data();
-        const previousReading = currentCustomer.currentReading;
-        if (previousReading !== undefined && reading < Number(previousReading)) {
-          throw new Error('The new meter reading cannot be lower than the previously recorded reading.');
-        }
         const recordedAt = new Date().toISOString();
-        transaction.update(customerReference, previousReading === undefined
-          ? {
-              cycleStartReading: reading,
-              currentReading: reading,
-              cycleStartedAt: recordedAt,
-              meterReadingUpdatedAt: recordedAt
-            }
-          : {
-              currentReading: reading,
-              meterReadingUpdatedAt: recordedAt
-            });
+        transaction.update(customerReference, {
+          cycleStartReading: lastReading,
+          currentReading: reading,
+          cycleStartedAt: recordedAt,
+          meterReadingUpdatedAt: recordedAt
+        });
       });
     } catch (error) {
       throw new Error(getCustomerAuthErrorMessage(error, 'record meter reading'));
@@ -384,6 +381,9 @@ export default function App() {
   async function setUserAdminRole(profile, makeAdmin) {
     if (role !== roles.ADMIN || !auth.currentUser) {
       throw new Error('Only a signed-in administrator can change administrator access.');
+    }
+    if (isProtectedAdminProfile(profile) && !makeAdmin) {
+      throw new Error('Blue Bill Admin cannot have administrator access removed.');
     }
     if (profile.uid === auth.currentUser.uid && !makeAdmin) {
       throw new Error('You cannot remove your own administrator access.');
@@ -1136,6 +1136,7 @@ function Dashboard({ role, user, accountRecords, customerUsers, registeredUsers,
             {filteredAdminCandidates.map((candidate) => {
               const isAdminAccount = candidate.role === roles.ADMIN;
               const isCurrentAdmin = candidate.uid === user?.uid;
+              const isProtectedAdminAccount = isProtectedAdminProfile(candidate);
               return (
                 <View style={styles.adminCandidateRow} key={candidate.uid}>
                   <View style={styles.listMain}>
@@ -1150,13 +1151,13 @@ function Dashboard({ role, user, accountRecords, customerUsers, registeredUsers,
                       accessibilityRole="button"
                       style={[
                         isAdminAccount ? styles.removeAdminAction : styles.requestAction,
-                        (promotingUserId === candidate.uid || (isAdminAccount && isCurrentAdmin)) && styles.disabledAction
+                        (promotingUserId === candidate.uid || (isAdminAccount && (isCurrentAdmin || isProtectedAdminAccount))) && styles.disabledAction
                       ]}
                       onPress={() => changeAdminRole(candidate, !isAdminAccount)}
-                      disabled={promotingUserId !== null || (isAdminAccount && isCurrentAdmin)}
+                      disabled={promotingUserId !== null || (isAdminAccount && (isCurrentAdmin || isProtectedAdminAccount))}
                     >
                       <Text style={isAdminAccount ? styles.removeAdminActionText : styles.requestActionText}>
-                        {promotingUserId === candidate.uid ? 'Saving...' : isAdminAccount ? isCurrentAdmin ? 'You' : 'Remove admin' : 'Make admin'}
+                        {promotingUserId === candidate.uid ? 'Saving...' : isAdminAccount ? isProtectedAdminAccount ? 'Protected' : isCurrentAdmin ? 'You' : 'Remove admin' : 'Make admin'}
                       </Text>
                     </Pressable>
                   </View>
@@ -1442,6 +1443,7 @@ function AddCustomer({ onSaveCustomer }) {
 }
 
 function LogBill({ customerUsers, selectedCustomer, onSelectCustomer, onRecordMeterReading, onLogBill }) {
+  const [lastMeterReading, setLastMeterReading] = useState('');
   const [meterReading, setMeterReading] = useState('');
   const [customerSearch, setCustomerSearch] = useState('');
   const [message, setMessage] = useState('');
@@ -1452,36 +1454,38 @@ function LogBill({ customerUsers, selectedCustomer, onSelectCustomer, onRecordMe
     (customer.name || 'Customer').toLowerCase().includes(customerSearch.trim().toLowerCase())
   );
   const activeCustomer = customerUsers.find((customer) => customer.id === selectedCustomer?.id) || selectedCustomer;
-  const hasStartingReading = activeCustomer?.cycleStartReading !== undefined
-    && activeCustomer?.currentReading !== undefined;
-  const currentUsage = hasStartingReading ? getActiveCustomerUsage(activeCustomer) : null;
+  const hasMeterEntries = lastMeterReading.trim() !== '' && meterReading.trim() !== ''
+    && Number.isFinite(Number(lastMeterReading)) && Number(lastMeterReading) >= 0
+    && Number.isFinite(Number(meterReading)) && Number(meterReading) >= 0;
+  const currentUsage = hasMeterEntries
+    ? Math.max(0, Number(meterReading) - Number(lastMeterReading))
+    : null;
   const billAmount = currentUsage === null ? 0 : currentUsage * waterRatePerCubicMeter;
 
   useEffect(() => {
-    setMeterReading('');
+    setLastMeterReading(activeCustomer?.cycleStartReading === undefined ? '' : String(activeCustomer.cycleStartReading));
+    setMeterReading(activeCustomer?.currentReading === undefined ? '' : String(activeCustomer.currentReading));
     setMessage('');
     setMessageIsSuccess(false);
     setLoggedBill(null);
-  }, [selectedCustomer?.id]);
+  }, [selectedCustomer?.id, activeCustomer?.cycleStartReading, activeCustomer?.currentReading]);
 
   async function saveMeterReading() {
     if (saving) return;
+    const previousReading = Number(lastMeterReading);
     const reading = Number(meterReading);
-    if (!activeCustomer || !meterReading.trim() || !Number.isFinite(reading) || reading < 0) {
-      setMessage('Enter a valid meter reading of zero or more.');
-      return;
-    }
-    if (hasStartingReading && reading < Number(activeCustomer.currentReading)) {
-      setMessage('The new meter reading cannot be lower than the previously recorded reading.');
+    if (!activeCustomer || !lastMeterReading.trim() || !meterReading.trim()
+      || !Number.isFinite(previousReading) || previousReading < 0
+      || !Number.isFinite(reading) || reading < 0) {
+      setMessage('Enter valid last and current meter readings of zero or more.');
       return;
     }
     setSaving(true);
     setMessage('');
     setLoggedBill(null);
     try {
-      await onRecordMeterReading(activeCustomer, reading);
-      setMeterReading('');
-      setMessage(hasStartingReading ? 'Meter reading saved. Monthly usage is updated.' : 'Starting meter reading saved. Usage will accrue from the next reading.');
+      await onRecordMeterReading(activeCustomer, previousReading, reading);
+      setMessage('Last and current meter readings saved. Monthly usage is updated.');
       setMessageIsSuccess(true);
     } catch (error) {
       setMessage(error.message || 'Unable to save the meter reading.');
@@ -1493,10 +1497,21 @@ function LogBill({ customerUsers, selectedCustomer, onSelectCustomer, onRecordMe
 
   async function logBill() {
     if (saving || !activeCustomer) return;
+    const previousReading = Number(lastMeterReading);
+    const reading = Number(meterReading);
+    if (!hasMeterEntries) {
+      setMessage('Enter valid last and current meter readings before logging a bill.');
+      setMessageIsSuccess(false);
+      return;
+    }
     setSaving(true);
     setMessage('');
     setLoggedBill(null);
     try {
+      if (previousReading !== Number(activeCustomer.cycleStartReading)
+        || reading !== Number(activeCustomer.currentReading)) {
+        await onRecordMeterReading(activeCustomer, previousReading, reading);
+      }
       const bill = await onLogBill(activeCustomer);
       setLoggedBill(bill);
       setMessage('Pending bill logged. The customer’s usage cycle has reset.');
@@ -1548,14 +1563,21 @@ function LogBill({ customerUsers, selectedCustomer, onSelectCustomer, onRecordMe
           <>
             <Text style={styles.customerLookupDetails}>Customer: {activeCustomer.name} ({activeCustomer.email}) · {activeCustomer.customerNumber}</Text>
             <Field
-              label={hasStartingReading ? 'New meter reading (m³)' : 'Starting meter reading (m³)'}
+              label="Last meter reading (m³)"
+              value={lastMeterReading}
+              onChangeText={setLastMeterReading}
+              placeholder="Enter last billed meter value"
+              keyboardType="decimal-pad"
+            />
+            <Field
+              label="Current meter reading (m³)"
               value={meterReading}
               onChangeText={setMeterReading}
-              placeholder={hasStartingReading ? String(activeCustomer.currentReading) : 'Enter current meter value'}
+              placeholder="Enter current meter value"
               keyboardType="decimal-pad"
             />
             <Button
-              label={saving ? 'Saving...' : hasStartingReading ? 'Record meter reading' : 'Set starting reading'}
+              label={saving ? 'Saving...' : 'Save meter readings'}
               onPress={saveMeterReading}
               disabled={saving}
             />
@@ -1563,9 +1585,9 @@ function LogBill({ customerUsers, selectedCustomer, onSelectCustomer, onRecordMe
               <Text style={styles.calculationTitle}>Current cycle usage</Text>
               <Text style={styles.calculationText}>Water used = current meter reading − last billed meter reading</Text>
               <Text style={styles.calculationText}>
-                {hasStartingReading
-                  ? `${Number(activeCustomer.currentReading).toLocaleString()} − ${Number(activeCustomer.cycleStartReading).toLocaleString()} = ${currentUsage.toLocaleString()} m³`
-                  : 'Set a starting reading, then record readings to build usage.'}
+                {currentUsage === null
+                  ? 'Enter both readings to calculate water usage.'
+                  : `${Number(meterReading).toLocaleString()} − ${Number(lastMeterReading).toLocaleString()} = ${currentUsage.toLocaleString()} m³`}
               </Text>
               <Text style={styles.calculationAmount}>Pending bill amount at ₱{waterRatePerCubicMeter}/m³: ₱{billAmount.toFixed(2)}</Text>
             </View>

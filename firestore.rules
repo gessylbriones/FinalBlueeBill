@@ -12,6 +12,11 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
     }
 
+    function isProtectedAdmin(email) {
+      return email is string
+        && email.matches('(?i)^bluebillproject@gmail\\.com$');
+    }
+
     match /users/{userId} {
       allow create: if signedIn()
         && request.auth.uid == userId
@@ -28,6 +33,10 @@ service cloud.firestore {
           isAdmin()
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role'])
           && request.resource.data.role in ['user', 'admin']
+          && (
+            !isProtectedAdmin(resource.data.email)
+            || request.resource.data.role == 'admin'
+          )
         ) || (
           signedIn()
           && request.auth.uid == userId
@@ -70,8 +79,9 @@ service cloud.firestore {
             'cycleStartReading', 'currentReading', 'cycleStartedAt', 'meterReadingUpdatedAt'
           ]) || (
             request.resource.data.cycleStartReading is number
+            && request.resource.data.cycleStartReading >= 0
             && request.resource.data.currentReading is number
-            && request.resource.data.currentReading >= request.resource.data.cycleStartReading
+            && request.resource.data.currentReading >= 0
             && request.resource.data.cycleStartedAt is string
             && request.resource.data.meterReadingUpdatedAt is string
           ))

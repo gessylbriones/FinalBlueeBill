@@ -69,6 +69,9 @@ usage and estimated amount; administrators see all authorized customers'
 current usage. Existing bills and customer records without meter readings do
 not provide a starting baseline; the admin must set a starting reading before
 usage can accrue.
+On the **Log bill** screen, admins can edit the last billed reading and current
+reading independently; readings are not restricted to increase from their
+previously saved values.
 
 Admins and customers can update their own name and city/district from the
 Profile page. Customer location changes are saved to both the account profile
@@ -88,10 +91,12 @@ a trusted project administrator should bootstrap this first role.
 After an administrator is active, they can open **Add New Admin** from the
 admin dashboard to manage administrator access for all registered accounts.
 They can promote a customer to `admin` or remove administrator access to return
-that account to the `user` role. Admins cannot remove their own access from this
-screen; a different administrator can demote them. Role changes are enforced by
-Firestore rules, and account owners must sign in again to use their new role.
-Customers cannot assign themselves administrator access.
+that account to the `user` role. The `bluebillproject@gmail.com` Blue Bill Admin
+account is protected and cannot be demoted by another administrator. Admins
+cannot remove their own access from this screen; a different administrator can
+demote them. Role changes are enforced by Firestore rules, and account owners
+must sign in again to use their new role. Customers cannot assign themselves
+administrator access.
 
 ## Firestore data
 
@@ -104,7 +109,8 @@ Customers cannot assign themselves administrator access.
 
 Publish `firestore.rules` in the Firebase Console after deploying the app.
 Those rules allow admins to promote registered users or return other admins
-to the customer role, prevent customers from granting themselves the admin
-role, and prevent customers from reading another customer's bills.
+to the customer role, protect the `bluebillproject@gmail.com` admin from
+demotion, prevent customers from granting themselves the admin role, and
+prevent customers from reading another customer's bills.
 Existing Supabase bills are not migrated automatically; import them into the
 Firestore `bills` collection if needed.
